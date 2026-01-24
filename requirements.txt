@@ -1,0 +1,17 @@
+# Core Dependencies
+anthropic>=0.40.0
+requests>=2.31.0
+python-dotenv>=1.0.0
+numpy>=1.24.0
+flask>=3.0.0
+
+# Optional but recommended
+werkzeug>=3.0.0
+
+# For better performance (optional)
+gunicorn>=21.2.0
+
+# Development tools (optional)
+pytest>=7.4.0
+black>=23.0.0
+flake8>=6.1.0
