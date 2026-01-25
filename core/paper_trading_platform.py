@@ -34,12 +34,28 @@ import logging
 import hashlib
 import random
 
-# Configure logging
+# Configure logging - WARNING by default (quieter), can be changed via set_verbosity()
 logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s | %(levelname)s | %(name)s | %(message)s'
+    level=logging.WARNING,
+    format='%(asctime)s | %(levelname)s | %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+
+def set_platform_verbosity(level: int):
+    """
+    Set the verbosity level for the paper trading platform.
+    
+    0 = quiet (WARNING only)
+    1 = normal (INFO)
+    2 = verbose (DEBUG)
+    """
+    if level >= 2:
+        logger.setLevel(logging.DEBUG)
+    elif level >= 1:
+        logger.setLevel(logging.INFO)
+    else:
+        logger.setLevel(logging.WARNING)
 
 
 # =============================================================================

@@ -47,7 +47,8 @@ from core.paper_trading_platform import (
     ABTestingFramework,
     HistoricalDataStore,
     ExitMonitorWatchdog,
-    ExitReason
+    ExitReason,
+    set_platform_verbosity
 )
 
 
@@ -71,6 +72,13 @@ class MasterConfig:
     enable_baseline_tracking: bool = True
     enable_historical_storage: bool = True
     enable_ab_testing: bool = True
+    
+    # Logging verbosity
+    # 0 = quiet (only positions opened/closed + errors)
+    # 1 = normal (+ periodic summaries)
+    # 2 = verbose (+ all signals)
+    # 3 = debug (+ all webhooks)
+    verbosity: int = 1
     
     @property
     def discovery_interval_hours(self) -> int:
@@ -402,14 +410,30 @@ class RobustPaperTradingEngine:
             return  # Only update hourly
         
         try:
-            # Get top 20 wallets by win rate
-            wallets = db.get_wallets(limit=100)
-            sorted_wallets = sorted(wallets, key=lambda w: w.get('win_rate', 0), reverse=True)
-            self._top_wallets = [w['address'] for w in sorted_wallets[:20] if w.get('win_rate', 0) >= 0.5]
+            # Try different method names that DatabaseV2 might have
+            wallets = []
+            
+            if hasattr(db, 'get_all_wallets'):
+                wallets = db.get_all_wallets()
+            elif hasattr(db, 'get_tracked_wallets'):
+                wallets = db.get_tracked_wallets()
+            elif hasattr(db, 'get_wallet_count'):
+                # Fallback: just skip top wallet tracking if we can't get the list
+                self._last_top_wallets_update = datetime.utcnow()
+                return
+            
+            if wallets:
+                sorted_wallets = sorted(wallets, key=lambda w: w.get('win_rate', 0), reverse=True)
+                self._top_wallets = [w['address'] for w in sorted_wallets[:20] if w.get('win_rate', 0) >= 0.5]
+                if CONFIG.verbosity >= 2:
+                    print(f"  📊 Updated top wallets: {len(self._top_wallets)} wallets with WR >= 50%")
+            
             self._last_top_wallets_update = datetime.utcnow()
-            print(f"  📊 Updated top wallets: {len(self._top_wallets)} wallets with WR >= 50%")
         except Exception as e:
-            print(f"  ⚠️ Failed to update top wallets: {e}")
+            # Don't spam the log - just update the timestamp so we don't retry constantly
+            self._last_top_wallets_update = datetime.utcnow()
+            if CONFIG.verbosity >= 2:
+                print(f"  ⚠️ Top wallets update skipped: {e}")
     
     def process_signal(self, signal: Dict, wallet_data: Dict = None) -> Dict:
         """
@@ -600,6 +624,10 @@ class TradingSystem:
         print("🚀 TRADING SYSTEM V2 - ROBUST PAPER TRADING PLATFORM")
         print("="*70)
         
+        # Set platform verbosity
+        set_platform_verbosity(CONFIG.verbosity)
+        print(f"   Verbosity: {CONFIG.verbosity} ({'quiet' if CONFIG.verbosity == 0 else 'normal' if CONFIG.verbosity == 1 else 'verbose' if CONFIG.verbosity == 2 else 'debug'})")
+        
         self.helius_key = os.getenv('HELIUS_KEY')
         self.anthropic_key = os.getenv('ANTHROPIC_API_KEY')
         self.webhook_id = os.getenv('HELIUS_WEBHOOK_ID')
@@ -619,7 +647,7 @@ class TradingSystem:
         # Initialize Robust Paper Trading Engine
         if CONFIG.paper_trading_enabled:
             self.paper_engine = RobustPaperTradingEngine(
-                self.db, 
+                self.db,
                 starting_balance=CONFIG.paper_starting_balance,
                 max_positions=CONFIG.max_open_positions
             )
@@ -895,7 +923,8 @@ class TradingSystem:
         if self.paper_engine:
             # Check minimum wallet WR (very permissive for learning)
             if wallet_wr < 0.30:
-                print(f"  ⏭️ SKIP: Low WR ({wallet_wr:.0%} < 30%)")
+                if CONFIG.verbosity >= 2:
+                    print(f"  ⏭️ SKIP: Low WR ({wallet_wr:.0%} < 30%)")
                 result['reason'] = f"Low wallet WR: {wallet_wr:.0%}"
                 return result
             
@@ -921,12 +950,13 @@ class TradingSystem:
             if self.paper_engine.baseline_tracker:
                 self.diagnostics.baseline_signals_recorded += 1
             
-            # Log the processing
-            print(f"\n  🎯 SIGNAL: ${signal_data['token_symbol']}")
-            print(f"     Price: ${price:.8f} | Liquidity: ${liquidity:,.0f}")
-            print(f"     Wallet WR: {wallet_wr:.0%} | Conviction: {conviction:.0f}")
-            print(f"     Quality: {process_result.get('quality_score', 50):.0f} | "
-                  f"Cluster: {'🔥 YES' if quality_metrics.get('is_cluster_signal') else 'No'}")
+            # Log the processing (only if verbose)
+            if CONFIG.verbosity >= 2:
+                print(f"\n  🎯 SIGNAL: ${signal_data['token_symbol']}")
+                print(f"     Price: ${price:.8f} | Liquidity: ${liquidity:,.0f}")
+                print(f"     Wallet WR: {wallet_wr:.0%} | Conviction: {conviction:.0f}")
+                print(f"     Quality: {process_result.get('quality_score', 50):.0f} | "
+                      f"Cluster: {'🔥 YES' if quality_metrics.get('is_cluster_signal') else 'No'}")
             
             # Check if position was opened
             if process_result.get('position_id'):
@@ -935,9 +965,13 @@ class TradingSystem:
                 
                 # Get exit params for display
                 exit_params = process_result.get('exit_params', {})
-                print(f"     ✅ POSITION OPENED (ID: {pos_id})")
-                print(f"     Stop: {exit_params.get('stop_loss_pct', -15):.0f}% | "
-                      f"TP: {exit_params.get('take_profit_pct', 30):.0f}%")
+                
+                # ALWAYS log position opens (verbosity >= 0)
+                print(f"  ✅ OPENED #{pos_id}: ${signal_data['token_symbol']} | "
+                      f"WR: {wallet_wr:.0%} | Conv: {conviction:.0f} | "
+                      f"SL: {exit_params.get('stop_loss_pct', -15):.0f}% | "
+                      f"TP: {exit_params.get('take_profit_pct', 30):.0f}%"
+                      f"{' 🔥CLUSTER' if quality_metrics.get('is_cluster_signal') else ''}")
                 
                 # Send entry notification
                 if self.notifier:
@@ -964,7 +998,8 @@ class TradingSystem:
                 result['conviction'] = conviction
                 
             else:
-                print(f"     ⚠️ Position not opened")
+                if CONFIG.verbosity >= 2:
+                    print(f"     ⚠️ Position not opened")
                 result['reason'] = 'Position open criteria not met'
         
         return result
@@ -997,6 +1032,11 @@ class TradingSystem:
 # ============================================================================
 app = Flask(__name__)
 trading_system: TradingSystem = None
+
+# Suppress werkzeug HTTP request logs unless verbose
+import logging as _logging
+if CONFIG.verbosity < 3:
+    _logging.getLogger('werkzeug').setLevel(_logging.WARNING)
 
 
 @app.route('/webhook/helius', methods=['POST'])
@@ -1203,6 +1243,7 @@ def background_tasks():
     last_discovery = datetime.now()
     last_status = datetime.now()
     last_learning = datetime.now()
+    last_summary = datetime.now()
     
     while True:
         try:
@@ -1212,6 +1253,22 @@ def background_tasks():
                 continue
             
             now = datetime.now()
+            
+            # Quick summary every 5 minutes (verbosity >= 1)
+            if CONFIG.verbosity >= 1 and (now - last_summary).total_seconds() >= 300:
+                last_summary = now
+                d = trading_system.diagnostics
+                stats = trading_system.paper_engine.get_stats() if trading_system.paper_engine else {}
+                
+                # Single-line summary
+                mins_since = (now - d.last_webhook_received).total_seconds() / 60 if d.last_webhook_received else 999
+                print(f"📡 {now.strftime('%H:%M')} | "
+                      f"Webhooks: {d.webhooks_received} | "
+                      f"Buy/Sell: {d.buy_signals_detected}/{d.sell_signals_detected} | "
+                      f"Opened: {d.positions_opened} | "
+                      f"Open: {stats.get('open_positions', 0)} | "
+                      f"Balance: {stats.get('balance', 0):.2f} SOL | "
+                      f"Last: {mins_since:.0f}m ago")
             
             # Hourly status
             if (now - last_status).total_seconds() >= 3600:
