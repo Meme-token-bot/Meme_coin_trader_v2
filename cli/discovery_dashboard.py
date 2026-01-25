@@ -3,6 +3,9 @@ Discovery Performance Monitor
 Track how well your hybrid discovery system is performing
 """
 
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # Go up ONE level
 from core.database_v2 import DatabaseV2
 from datetime import datetime, timedelta
 import json

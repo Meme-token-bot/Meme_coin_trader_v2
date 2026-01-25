@@ -2,7 +2,9 @@
 """
 Debug Diagnostic - See exactly what's in token transactions
 """
-
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # Go up ONE level
 import os
 import requests
 import time

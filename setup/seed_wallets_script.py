@@ -2,7 +2,9 @@
 Seed Wallets Script
 Use this to manually add verified wallets to your database
 """
-
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # Go up ONE level
 from core.database_v2 import DatabaseV2
 from datetime import datetime
 

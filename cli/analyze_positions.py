@@ -8,6 +8,9 @@ Analyzes your 55 open positions to understand:
 3. What's the realistic performance?
 """
 
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # Go up ONE level
 import os
 import requests
 from datetime import datetime

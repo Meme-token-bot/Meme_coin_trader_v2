@@ -1,14 +1,28 @@
+#!/usr/bin/env python3
 """
 Register a manually created Helius webhook with the database.
 
 Usage:
-    python register_webhook.py <webhook_id>
-    python register_webhook.py list
-    python register_webhook.py sync
+    python setup/register_webhook.py list
+    python setup/register_webhook.py sync
+    python setup/register_webhook.py <webhook_id>
+    python setup/register_webhook.py add <id> <addr1> [addr2...]
 """
 
-import os
+# ============================================================================
+# PATH SETUP - Required for scripts in subdirectories
+# ============================================================================
 import sys
+from pathlib import Path
+
+# Add project root to Python path (go up one level from setup/)
+project_root = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(project_root))
+sys.path.insert(0, str(project_root / 'core'))
+sys.path.insert(0, str(project_root / 'infrastructure'))
+# ============================================================================
+
+import os
 import requests
 from datetime import datetime
 from dotenv import load_dotenv
@@ -178,20 +192,22 @@ def sync_all_webhooks(db: DatabaseV2):
                         VALUES (?, ?, ?)
                     """, (addr, webhook_id, datetime.now()))
             
-            print(f"  ✅ {webhook_id[:12]}... ({len(addresses)} addresses)")
+            print(f"  ✅ Synced {webhook_id[:12]}... ({len(addresses)} addresses)")
             registered += 1
         
-        print(f"\n✅ Synced {registered} webhook(s)")
+        print(f"\n✅ Synced {registered} webhook(s) to database")
         
     except Exception as e:
         print(f"❌ Error: {e}")
+        import traceback
+        traceback.print_exc()
 
 
 def add_wallets_to_webhook(db: DatabaseV2, webhook_id: str, addresses: list):
-    """Add wallets to a specific webhook"""
-    print(f"\n📦 Adding {len(addresses)} wallet(s) to webhook {webhook_id[:12]}...")
+    """Add wallet addresses to a specific webhook"""
+    print(f"\n📝 Adding {len(addresses)} wallet(s) to webhook {webhook_id[:12]}...")
     
-    # Get current state
+    # Get current webhook state
     url = f"https://api.helius.xyz/v0/webhooks/{webhook_id}?api-key={HELIUS_KEY}"
     
     try:
@@ -202,33 +218,31 @@ def add_wallets_to_webhook(db: DatabaseV2, webhook_id: str, addresses: list):
             return False
         
         wh = response.json()
-        existing = wh.get('accountAddresses', [])
-        wh_url = wh.get('webhookURL', '')
-        wh_type = wh.get('webhookType', 'enhanced')
-        tx_types = wh.get('transactionTypes', ['SWAP'])
+        existing = set(wh.get('accountAddresses', []))
         
-        # Check capacity
-        available = 25 - len(existing)
-        if available <= 0:
-            print(f"❌ Webhook at capacity (25/25)")
-            return False
-        
-        # Add new addresses
-        to_add = [a for a in addresses if a not in existing][:available]
+        # Filter new addresses
+        to_add = [a for a in addresses if a not in existing]
         
         if not to_add:
-            print(f"ℹ️  All addresses already in webhook")
+            print("ℹ️  All addresses already in webhook")
             return True
         
-        all_addresses = existing + to_add
+        if len(existing) + len(to_add) > 25:
+            print(f"⚠️  Would exceed 25 address limit!")
+            print(f"   Current: {len(existing)}, Adding: {len(to_add)}")
+            max_can_add = 25 - len(existing)
+            to_add = to_add[:max_can_add]
+            print(f"   Only adding {max_can_add}")
         
         # Update webhook
+        all_addresses = list(existing) + to_add
+        
         update_url = f"https://api.helius.xyz/v0/webhooks/{webhook_id}?api-key={HELIUS_KEY}"
         payload = {
-            "webhookURL": wh_url,
+            "webhookURL": wh.get('webhookURL'),
             "accountAddresses": all_addresses,
-            "webhookType": wh_type,
-            "transactionTypes": tx_types
+            "webhookType": wh.get('webhookType', 'enhanced'),
+            "transactionTypes": wh.get('transactionTypes', ['SWAP'])
         }
         
         response = requests.put(update_url, json=payload, timeout=15)
@@ -238,7 +252,7 @@ def add_wallets_to_webhook(db: DatabaseV2, webhook_id: str, addresses: list):
             with db.connection() as conn:
                 for addr in to_add:
                     conn.execute("""
-                        INSERT OR REPLACE INTO wallet_webhook_assignments
+                        INSERT OR IGNORE INTO wallet_webhook_assignments
                         (wallet_address, webhook_id, assigned_at)
                         VALUES (?, ?, ?)
                     """, (addr, webhook_id, datetime.now()))
@@ -271,10 +285,10 @@ if __name__ == "__main__":
     
     if len(sys.argv) < 2:
         print("Usage:")
-        print("  python register_webhook.py list       - List all webhooks")
-        print("  python register_webhook.py sync       - Sync Helius → Database")
-        print("  python register_webhook.py <id>       - Register specific webhook")
-        print("  python register_webhook.py add <id> <addr1> [addr2...]  - Add wallets to webhook")
+        print("  python setup/register_webhook.py list       - List all webhooks")
+        print("  python setup/register_webhook.py sync       - Sync Helius → Database")
+        print("  python setup/register_webhook.py <id>       - Register specific webhook")
+        print("  python setup/register_webhook.py add <id> <addr1> [addr2...]  - Add wallets to webhook")
         sys.exit(0)
     
     command = sys.argv[1].lower()

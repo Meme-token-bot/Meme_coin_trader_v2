@@ -1,7 +1,9 @@
 """
 Simple API Test - Check if DexScreener is accessible
 """
-
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # Go up ONE level
 import requests
 
 def test_dexscreener():
