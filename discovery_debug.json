@@ -1,41 +1,34 @@
 {
-  "timestamp": "2026-01-25T19:11:27.303329",
+  "timestamp": "2026-01-25T23:08:48.941819",
   "stats": {
-    "candidates_found": 7,
+    "candidates_found": 4,
     "from_birdeye": 0,
-    "from_new_tokens": 6,
+    "from_new_tokens": 3,
     "from_reverse": 1,
-    "validated": 7,
-    "profiled": 7,
-    "verified": 2,
+    "validated": 4,
+    "profiled": 4,
+    "verified": 1,
     "verified_wallets": [
       {
-        "address": "2AXKCshcLRDU2EFXpWw4FCpDHoqRY5wjbn9mtGDsAbGb",
-        "win_rate": 0.5714285714285714,
-        "pnl_sol": 4.089564177297461,
-        "completed_swings": 14,
+        "address": "H55tLdMYWMnoWqNdkaSTqBH9WP6e75niPcTKEUWUkRTd",
+        "win_rate": 0.8,
+        "pnl_sol": 16.266285295525183,
+        "completed_swings": 10,
         "source": "new_token"
-      },
-      {
-        "address": "9v3xeLZiWPevBN8ydoDdc7W6KRofScFKYsnizD9WZCmp",
-        "win_rate": 0.6,
-        "pnl_sol": 2.211799592000001,
-        "completed_swings": 35,
-        "source": "reverse_discovery"
       }
     ],
-    "api_credits_used": 276,
+    "api_credits_used": 252,
     "from_high_volume": 0
   },
   "budget": {
     "total": 1000,
-    "used": 276,
+    "used": 252,
     "breakdown": {
       "reverse_signatures": 20,
       "reverse_parse": 200,
-      "validate_signatures": 7,
-      "validate_parse": 14,
-      "profile_get_swaps": 35
+      "validate_signatures": 4,
+      "validate_parse": 8,
+      "profile_get_swaps": 20
     }
   },
   "config": {

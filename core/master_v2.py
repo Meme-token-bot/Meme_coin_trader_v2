@@ -1,13 +1,14 @@
 """
-MASTER V2 - Webhook-Based Trading System with Learning Paper Trader
-Trading System V2 - Uses Helius webhooks + smart discovery + LEARNING MODE
+MASTER V2 - ROBUST PAPER TRADING PLATFORM INTEGRATION
+======================================================
 
-UPDATED: Integrated Learning Paper Trader with:
-1. Unlimited position opening for data collection
-2. Comprehensive time-of-day tracking for diurnal analysis
-3. Fixed hold time in Telegram notifications
-4. Automatic learning loop every 6 hours
-5. Progressive strategy refinement
+Full integration with all 6 improvements:
+1. Exit Monitoring Reliability (Watchdog)
+2. Baseline Comparison
+3. A/B Testing Framework
+4. Historical Backtesting
+5. Signal Quality Metrics
+6. Dynamic Exit Parameters
 
 COMPLETE VERSION - Ready to run
 """
@@ -19,7 +20,7 @@ import json
 import threading
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from collections import deque
 
 from flask import Flask, request, jsonify
@@ -34,18 +35,25 @@ from core.discovery_config import config as discovery_config
 from infrastructure.helius_webhook_manager import HeliusWebhookManager
 
 # ============================================================================
-# CHANGE 1: Import Learning Paper Trader components
+# IMPORT ROBUST PAPER TRADING PLATFORM
 # ============================================================================
-from core.learning_paper_trader import (
-    LearningPaperTrader, 
-    LearningConfig, 
+from core.paper_trading_platform import (
+    RobustPaperTrader,
+    SignalQualityAnalyzer,
+    SignalQualityMetrics,
+    DynamicExitCalculator,
+    DynamicExitParams,
+    BaselineTracker,
+    ABTestingFramework,
+    HistoricalDataStore,
+    ExitMonitorWatchdog,
     ExitReason
 )
 
 
 @dataclass
 class MasterConfig:
-    """Master configuration - now uses discovery_config for discovery settings"""
+    """Master configuration"""
     webhook_host: str = '0.0.0.0'
     webhook_port: int = 5000
     position_check_interval: int = 300
@@ -55,17 +63,21 @@ class MasterConfig:
     paper_trading_enabled: bool = True
     paper_starting_balance: float = 10.0
     use_llm: bool = True
-    max_open_positions: int = 999  # CHANGED: Unlimited for learning mode
+    max_open_positions: int = 999  # Unlimited for learning mode
     max_position_size_sol: float = 1.0
+    
+    # Robust platform features
+    enable_watchdog: bool = True
+    enable_baseline_tracking: bool = True
+    enable_historical_storage: bool = True
+    enable_ab_testing: bool = True
     
     @property
     def discovery_interval_hours(self) -> int:
-        """Get discovery interval from discovery_config"""
         return discovery_config.discovery_interval_hours
     
     @property
     def discovery_api_budget(self) -> int:
-        """Get discovery API budget from discovery_config"""
         return discovery_config.max_api_calls_per_discovery
 
 
@@ -124,7 +136,7 @@ class DiagnosticsTracker:
     discoveries_run: int = 0
     wallets_discovered: int = 0
     learning_iterations: int = 0
-    # NEW: Debug counters for webhook processing
+    # Debug counters
     buy_signals_detected: int = 0
     sell_signals_detected: int = 0
     untracked_wallet_skips: int = 0
@@ -134,6 +146,10 @@ class DiagnosticsTracker:
     token_info_failures: int = 0
     learning_filter_passes: int = 0
     learning_filter_fails: int = 0
+    # New: Quality metrics tracking
+    cluster_signals_detected: int = 0
+    high_conviction_signals: int = 0
+    baseline_signals_recorded: int = 0
     recent_events: deque = field(default_factory=lambda: deque(maxlen=50))
     
     def log_event(self, event_type: str, details: str = ""):
@@ -167,21 +183,21 @@ class DiagnosticsTracker:
             'signals': {
                 'buy_detected': self.buy_signals_detected,
                 'sell_detected': self.sell_signals_detected,
+                'cluster_signals': self.cluster_signals_detected,
+                'high_conviction': self.high_conviction_signals,
             },
             'api': {'calls': self.api_calls_made, 'errors': self.api_errors, 'token_info_failures': self.token_info_failures},
             'positions': {'opened': self.positions_opened, 'closed': self.positions_closed},
             'discovery': {'runs': self.discoveries_run, 'wallets_found': self.wallets_discovered},
             'learning_iterations': self.learning_iterations,
+            'baseline_signals_recorded': self.baseline_signals_recorded,
             'llm_calls': self.llm_calls,
             'recent_events': list(self.recent_events)[-10:]
         }
 
 
-# ============================================================================
-# CHANGE 2: Fixed Notifier with accurate hold time
-# ============================================================================
 class Notifier:
-    """Telegram notifier with FIXED hold time display"""
+    """Telegram notifier with enhanced alerts"""
     
     def __init__(self, token: str = None, chat_id: str = None):
         self.token = token or os.getenv('TELEGRAM_BOT_TOKEN')
@@ -199,231 +215,178 @@ class Notifier:
         except Exception as e:
             print(f"  ⚠️ Telegram error: {e}")
     
-    def send_entry_alert(self, signal: Dict, decision: Dict):
-        """Send entry notification with learning context"""
+    def send_entry_alert(self, signal: Dict, decision: Dict, quality: SignalQualityMetrics = None):
+        """Send entry notification with quality metrics"""
         current_hour = datetime.utcnow().hour
         
-        msg = f"""🎯 <b>ENTRY SIGNAL</b>
+        cluster_str = "🔥 CLUSTER" if (quality and quality.is_cluster_signal) else ""
+        quality_score = quality.calculate_composite_score() if quality else 50
+        
+        msg = f"""🎯 <b>ENTRY SIGNAL</b> {cluster_str}
 
 Token: ${signal.get('token_symbol', 'UNKNOWN')}
 Conviction: {decision.get('conviction_score', 0):.0f}/100
+Quality: {quality_score:.0f}/100
 Wallets: {decision.get('wallet_count', 1)}
 Regime: {decision.get('regime', 'UNKNOWN')}
 Position: {decision.get('position_size_sol', 0):.3f} SOL
-Stop: {decision.get('stop_loss', 0)*100:.0f}%
-Target: {decision.get('take_profit', 0)*100:.0f}%
-LLM: {'✅' if decision.get('llm_called') else '❌'}
+Stop: {decision.get('stop_loss_pct', -15):.0f}%
+Target: {decision.get('take_profit_pct', 30):.0f}%
 Hour (UTC): {current_hour:02d}:00"""
         self.send(msg)
     
     def send_exit_alert(self, position: Dict, reason: str, pnl_pct: float, result: Dict = None):
-        """
-        Send exit notification with FIXED hold time.
-        
-        CHANGE 4: Now accepts result dict for accurate hold time
-        """
+        """Send exit notification with hold time"""
         emoji = "🟢" if pnl_pct > 0 else "🔴"
         
-        # FIX: Get hold time from multiple sources
         hold_mins = self._get_hold_time(position, result)
         
-        # Format hold time nicely
         if hold_mins >= 60:
             hold_str = f"{hold_mins/60:.1f}h ({hold_mins:.0f}m)"
         else:
             hold_str = f"{hold_mins:.0f} min"
         
-        # Get PnL in SOL
-        pnl_sol = 0
-        if result:
-            pnl_sol = result.get('pnl_sol', 0)
-        
-        # Get entry/exit hours for diurnal tracking display
-        entry_hour = position.get('entry_hour_utc', 'N/A')
-        exit_hour = datetime.utcnow().hour
+        pnl_sol = result.get('pnl_sol', 0) if result else 0
         
         msg = f"""{emoji} <b>EXIT</b>
 
 Token: ${position.get('token_symbol', 'UNKNOWN')}
 Reason: {reason}
 P&L: {pnl_pct:+.1f}% ({pnl_sol:+.4f} SOL)
-Hold: {hold_str}
-Entry Hour: {entry_hour}:00 UTC
-Exit Hour: {exit_hour:02d}:00 UTC"""
+Hold: {hold_str}"""
         self.send(msg)
     
     def _get_hold_time(self, position: Dict, result: Dict = None) -> float:
-        """
-        Get hold time from multiple possible sources.
-        This is THE FIX for the "Hold: 0 minutes" bug.
-        """
-        # Priority 1: From result dict (most accurate)
+        """Extract hold time from various sources"""
         if result:
-            if result.get('hold_minutes'):
+            if 'hold_minutes' in result:
                 return result['hold_minutes']
-            if result.get('hold_duration_minutes'):
+            if 'hold_duration_minutes' in result:
                 return result['hold_duration_minutes']
         
-        # Priority 2: From position dict (check multiple field names)
-        if position.get('hold_duration_minutes'):
+        if 'hold_duration_minutes' in position:
             return position['hold_duration_minutes']
-        if position.get('hold_minutes'):
-            return position['hold_minutes']
         
-        # Priority 3: Calculate from timestamps
         entry_time = position.get('entry_time')
-        exit_time = position.get('exit_time') or datetime.utcnow()
-        
         if entry_time:
             if isinstance(entry_time, str):
-                try:
-                    entry_time = datetime.fromisoformat(entry_time.replace('Z', ''))
-                except:
-                    return 0
-            
-            if isinstance(exit_time, str):
-                try:
-                    exit_time = datetime.fromisoformat(exit_time.replace('Z', ''))
-                except:
-                    exit_time = datetime.utcnow()
-            
-            return (exit_time - entry_time).total_seconds() / 60
+                entry_time = datetime.fromisoformat(entry_time.replace('Z', ''))
+            return (datetime.utcnow() - entry_time).total_seconds() / 60
         
         return 0
     
-    def send_discovery_alert(self, wallet: str, performance: Dict):
-        msg = f"""🎯 <b>NEW WALLET DISCOVERED</b>
-
-Address: <code>{wallet}</code>
-Win Rate: {performance.get('win_rate', 0):.1%}
-PnL (7d): {performance.get('pnl', 0):.2f} SOL
-Completed Swings: {performance.get('completed_swings', 0)}
-Avg Hold: {performance.get('avg_hold_hours', 0):.1f}h
-
-✅ Automatically added to webhook!"""
-        self.send(msg)
-    
-    def send_hourly_status(self, diagnostics: DiagnosticsTracker, paper_stats: Dict):
-        now = datetime.now()
-        if self._last_status_sent and (now - self._last_status_sent).total_seconds() < 3600:
-            return
-        self._last_status_sent = now
-        
-        diag = diagnostics.to_dict()
-        last_webhook = f"{diag['minutes_since_last_webhook']:.0f}m ago" if diag['minutes_since_last_webhook'] else "Never"
-        
-        # Include learning info
-        phase = paper_stats.get('phase', 'N/A')
-        iteration = paper_stats.get('iteration', 0)
-        blocked_hours = paper_stats.get('blocked_hours', [])
-        
-        # Include webhook breakdown
-        d = diagnostics
+    def send_hourly_status(self, stats: Dict, diag: Dict, learning_stats: Dict = None):
+        """Send hourly status with platform metrics"""
+        uptime_hours = diag.get('uptime_hours', 0)
         
         msg = f"""📊 <b>Hourly Status</b>
 
-Uptime: {diag['uptime_hours']:.1f}h
-Webhooks: {d.webhooks_received} received
-Last webhook: {last_webhook}
-Paper: {paper_stats.get('balance', 0):.2f} SOL ({paper_stats.get('return_pct', 0):+.1f}%)
-Open positions: {paper_stats.get('open_positions', 0)}
-Win rate: {paper_stats.get('win_rate', 0):.0%}
+Uptime: {uptime_hours:.1f}h
+Webhooks: {diag['webhooks']['received']} received
+Last webhook: {diag.get('minutes_since_last_webhook', 0):.0f}m ago
+Paper: {stats.get('balance', 0):.2f} SOL ({stats.get('return_pct', 0):+.1f}%)
+Open positions: {stats.get('open_positions', 0)}
+Win rate: {stats.get('win_rate', 0):.0%}
 
 📈 <b>Webhook Breakdown:</b>
-• Processed: {d.webhooks_processed}
-• BUY signals: {d.buy_signals_detected}
-• SELL signals: {d.sell_signals_detected}
-• Positions opened: {d.positions_opened}
-• Skip: {d.untracked_wallet_skips} untracked, {d.non_swap_skips} non-swap
+• Processed: {diag['webhooks']['processed']}
+• BUY signals: {diag['signals']['buy_detected']}
+• SELL signals: {diag['signals']['sell_detected']}
+• Positions opened: {diag['positions']['opened']}
+• Skip: {diag['webhooks']['skip_reasons']['untracked_wallet']} untracked, {diag['webhooks']['skip_reasons']['non_swap']} non-swap
 
-🎓 <b>Learning:</b>
-Phase: {phase}
-Iteration: {iteration}
-Blocked hours: {blocked_hours if blocked_hours else 'None'}"""
+🔥 <b>Quality Metrics:</b>
+• Cluster signals: {diag['signals'].get('cluster_signals', 0)}
+• High conviction: {diag['signals'].get('high_conviction', 0)}
+• Baseline recorded: {diag.get('baseline_signals_recorded', 0)}"""
+
+        if learning_stats:
+            msg += f"""
+
+🧪 <b>Learning:</b>
+Phase: {learning_stats.get('phase', 'exploration')}
+Iteration: {learning_stats.get('iteration', 0)}
+Blocked hours: {learning_stats.get('blocked_hours', 'None') or 'None'}"""
+        
         self.send(msg)
     
-    def send_learning_alert(self, results: Dict):
-        """Send learning iteration results"""
-        perf = results.get('performance', {})
-        
-        msg = f"""🎓 <b>LEARNING ITERATION #{results.get('iteration', 0)}</b>
+    def send_cluster_alert(self, token_symbol: str, wallet_count: int, wallets: List[str]):
+        """Send alert when cluster signal detected"""
+        wallet_preview = ", ".join(w[:8] + "..." for w in wallets[:3])
+        msg = f"""🔥 <b>CLUSTER SIGNAL DETECTED</b>
 
-📊 Performance:
-• Trades: {perf.get('total_trades', 0)}
-• Win Rate: {perf.get('win_rate', 0):.1%}
-• Total PnL: {perf.get('total_pnl', 0):+.4f} SOL
+Token: ${token_symbol}
+Wallets buying: {wallet_count}
+Wallets: {wallet_preview}
 
-📈 Current Phase: {results.get('phase', 'unknown')}
-"""
+Multiple smart wallets buying simultaneously!"""
+        self.send(msg)
+    
+    def send_baseline_report(self, report: Dict):
+        """Send baseline comparison report"""
+        msg = "📊 <b>BASELINE COMPARISON (7 days)</b>\n\n"
         
-        if results.get('phase_changed'):
-            msg += f"\n🎯 <b>PHASE CHANGE: {results.get('new_phase')}</b>\n"
+        for baseline, data in report.items():
+            if data['entered'] > 0:
+                msg += f"<b>{baseline.upper()}</b>\n"
+                msg += f"  Entered: {data['entered']} | WR: {data['win_rate']:.0%} | PnL: {data['total_pnl_pct']:+.1f}%\n\n"
         
-        blocked = results.get('blocked_hours', [])
-        preferred = results.get('preferred_hours', [])
-        
-        if blocked:
-            msg += f"\n🚫 Blocked Hours: {blocked}"
-        if preferred:
-            msg += f"\n⭐ Preferred Hours: {preferred}"
-        
-        recs = results.get('recommendations', [])[:3]
-        if recs:
-            msg += "\n\n💡 Recommendations:"
-            for rec in recs:
-                msg += f"\n• {rec[:80]}"
+        # Find best
+        best = max(report.items(), key=lambda x: x[1].get('total_pnl_pct', 0))
+        msg += f"🏆 Best: {best[0].upper()} with {best[1]['total_pnl_pct']:+.1f}% PnL"
         
         self.send(msg)
 
 
 # ============================================================================
-# CHANGE 3: Learning Paper Trading Engine (drop-in replacement)
+# ROBUST PAPER TRADING ENGINE WRAPPER
 # ============================================================================
-class LearningPaperTradingEngine:
+class RobustPaperTradingEngine:
     """
-    Drop-in replacement for PaperTradingEngine with learning capabilities.
+    Full integration wrapper for RobustPaperTrader with all features.
     
-    Key differences:
-    - No position limits (collects maximum data)
-    - Comprehensive time tracking
-    - Automatic learning every 6 hours
-    - Progressive threshold tightening
-    - NO LIQUIDITY FILTER in learning mode
+    Features:
+    1. ✅ Exit Monitoring Watchdog
+    2. ✅ Baseline Comparison
+    3. ✅ A/B Testing
+    4. ✅ Historical Backtesting
+    5. ✅ Signal Quality Metrics
+    6. ✅ Dynamic Exit Parameters
     """
     
     def __init__(self, db, starting_balance: float = 10.0, max_positions: int = None):
         self.db = db
         
-        config = LearningConfig(
-            starting_balance_sol=starting_balance,
-            max_open_positions=999,  # No limit for learning
-            enable_auto_exits=True,
-            learning_interval_hours=6.0
+        # Initialize the robust trader with all features
+        self._trader = RobustPaperTrader(
+            db_path="robust_paper_trades.db",
+            starting_balance=starting_balance,
+            enable_watchdog=CONFIG.enable_watchdog,
+            enable_baseline_tracking=CONFIG.enable_baseline_tracking,
+            enable_historical_storage=CONFIG.enable_historical_storage
         )
         
-        self._trader = LearningPaperTrader(
-            db_path="learning_paper_trades.db",
-            config=config
-        )
+        # Store reference to components for direct access
+        self.quality_analyzer = self._trader.quality_analyzer
+        self.exit_calculator = self._trader.exit_calculator
+        self.baseline_tracker = self._trader.baseline_tracker
+        self.historical_store = self._trader.historical_store
+        self.ab_testing = self._trader.ab_testing
+        self.watchdog = self._trader.watchdog
         
-        # CRITICAL: Disable liquidity threshold for learning mode
-        # The whole point is to LEARN what works, not filter prematurely
-        if hasattr(self._trader, 'config'):
-            if hasattr(self._trader.config, 'min_liquidity_usd'):
-                self._trader.config.min_liquidity_usd = 0
-            if hasattr(self._trader.config, 'min_conviction_score'):
-                self._trader.config.min_conviction_score = 0
-            if hasattr(self._trader.config, 'min_wallet_win_rate'):
-                self._trader.config.min_wallet_win_rate = 0
+        # Track top wallets for baseline comparison
+        self._top_wallets: List[str] = []
+        self._last_top_wallets_update = datetime.utcnow() - timedelta(hours=1)
         
+        # Learning timing
         self._last_learning = datetime.utcnow() - timedelta(hours=5)
         
-        print(f"🎓 Learning Paper Trading Engine initialized")
-        print(f"   Phase: {self._trader.config.current_phase}")
+        print(f"🚀 ROBUST PAPER TRADING ENGINE initialized")
         print(f"   Balance: {self._trader.balance:.4f} SOL")
         print(f"   Positions: {self._trader.open_position_count}")
-        print(f"   Mode: LEARNING (unlimited positions)")
-        print(f"   Min Liquidity: ${self._trader.config.min_liquidity_usd:,.0f} (DISABLED)")
+        print(f"   Watchdog: {'ENABLED' if CONFIG.enable_watchdog else 'DISABLED'}")
+        print(f"   Baseline Tracking: {'ENABLED' if CONFIG.enable_baseline_tracking else 'DISABLED'}")
+        print(f"   Historical Storage: {'ENABLED' if CONFIG.enable_historical_storage else 'DISABLED'}")
     
     @property
     def balance(self) -> float:
@@ -433,85 +396,59 @@ class LearningPaperTradingEngine:
     def available_balance(self) -> float:
         return self._trader.balance - self._trader.reserved_balance
     
-    def open_position(self, signal: Dict, decision: Dict, price: float) -> Optional[int]:
-        """Open a paper position with learning tracking"""
-        signal_data = {
-            'token_address': signal.get('token_address', ''),
-            'token_symbol': signal.get('token_symbol', 'UNKNOWN'),
-            'liquidity': signal.get('liquidity', 0),
-            'volume_24h': signal.get('volume_24h', 0),
-            'market_cap': signal.get('market_cap', 0),
-            'token_age_hours': signal.get('token_age_hours', 0),
-            'holder_count': signal.get('holder_count', 0),
-            'conviction_score': decision.get('conviction_score', 50),
-            'wallet_win_rate': signal.get('wallet_win_rate', 0.5)
-        }
+    def update_top_wallets(self, db):
+        """Update list of top wallets for baseline comparison"""
+        if (datetime.utcnow() - self._last_top_wallets_update).total_seconds() < 3600:
+            return  # Only update hourly
         
+        try:
+            # Get top 20 wallets by win rate
+            wallets = db.get_wallets(limit=100)
+            sorted_wallets = sorted(wallets, key=lambda w: w.get('win_rate', 0), reverse=True)
+            self._top_wallets = [w['address'] for w in sorted_wallets[:20] if w.get('win_rate', 0) >= 0.5]
+            self._last_top_wallets_update = datetime.utcnow()
+            print(f"  📊 Updated top wallets: {len(self._top_wallets)} wallets with WR >= 50%")
+        except Exception as e:
+            print(f"  ⚠️ Failed to update top wallets: {e}")
+    
+    def process_signal(self, signal: Dict, wallet_data: Dict = None) -> Dict:
+        """
+        Process a trading signal through the full pipeline.
+        
+        This is the main entry point that:
+        1. Analyzes signal quality (clusters, timing, sizing)
+        2. Calculates dynamic exit parameters
+        3. Records for baseline comparison
+        4. Stores for historical backtesting
+        5. Opens position if appropriate
+        
+        Returns dict with decision info and position_id if opened
+        """
+        return self._trader.process_signal(
+            signal=signal,
+            wallet_data=wallet_data,
+            top_wallets=self._top_wallets
+        )
+    
+    def open_position(self, signal: Dict, decision: Dict, price: float) -> Optional[int]:
+        """
+        Legacy interface for opening positions.
+        Converts to process_signal() internally.
+        """
+        signal['price'] = price
+        
+        # Build wallet_data from signal
         wallet_data = {
             'address': signal.get('wallet', signal.get('wallet_address', '')),
             'win_rate': signal.get('wallet_win_rate', 0.5),
             'cluster': signal.get('wallet_cluster', 'UNKNOWN'),
-            'roi_7d': signal.get('wallet_roi', 0),
-            'trades_count': signal.get('wallet_trades', 0)
         }
         
-        stop_loss = decision.get('stop_loss', -0.15)
-        if stop_loss > 0:
-            stop_loss = -stop_loss
-        stop_loss_pct = stop_loss * 100
-        
-        take_profit = decision.get('take_profit', 0.30)
-        take_profit_pct = take_profit * 100
-        
-        return self._trader.open_position(
-            token_address=signal.get('token_address', ''),
-            token_symbol=signal.get('token_symbol', 'UNKNOWN'),
-            entry_price=price,
-            signal=signal_data,
-            wallet_data=wallet_data,
-            decision=decision,
-            size_sol=decision.get('position_size_sol'),
-            stop_loss=stop_loss_pct,
-            take_profit=take_profit_pct
-        )
-    
-    def check_exit_conditions(self, position: Dict, current_price: float) -> Optional[str]:
-        """Check if position should exit (handled by background monitor)"""
-        entry_price = position.get('entry_price', 0)
-        if entry_price <= 0 or current_price <= 0:
-            return None
-        
-        pnl_pct = ((current_price / entry_price) - 1) * 100
-        
-        if pnl_pct <= position.get('stop_loss_pct', -15):
-            return 'STOP_LOSS'
-        if pnl_pct >= position.get('take_profit_pct', 30):
-            return 'TAKE_PROFIT'
-        
-        peak_price = position.get('peak_price', entry_price)
-        trailing_stop = position.get('trailing_stop_pct', 10)
-        
-        if peak_price > entry_price:
-            peak_pnl_pct = ((peak_price / entry_price) - 1) * 100
-            if peak_pnl_pct >= 15:
-                from_peak_pct = ((current_price / peak_price) - 1) * 100
-                if from_peak_pct <= -trailing_stop:
-                    return 'TRAILING_STOP'
-        
-        entry_time = position.get('entry_time')
-        max_hold = position.get('max_hold_hours', 12)
-        
-        if entry_time:
-            if isinstance(entry_time, str):
-                entry_time = datetime.fromisoformat(entry_time.replace('Z', ''))
-            hold_hours = (datetime.utcnow() - entry_time).total_seconds() / 3600
-            if hold_hours >= max_hold:
-                return 'TIME_STOP'
-        
-        return None
+        result = self.process_signal(signal, wallet_data)
+        return result.get('position_id')
     
     def close_position(self, position_id: int, exit_reason: str, exit_price: float) -> Optional[Dict]:
-        """Close a paper position with accurate hold time tracking"""
+        """Close a paper position"""
         reason_map = {
             'STOP_LOSS': ExitReason.STOP_LOSS,
             'TAKE_PROFIT': ExitReason.TAKE_PROFIT,
@@ -519,17 +456,13 @@ class LearningPaperTradingEngine:
             'TIME_STOP': ExitReason.TIME_STOP,
             'SMART_EXIT': ExitReason.SMART_EXIT,
             'MANUAL': ExitReason.MANUAL,
+            'WATCHDOG': ExitReason.WATCHDOG,
         }
         
-        # Handle exit reasons that might have extra text
         clean_reason = exit_reason.split(':')[0] if ':' in exit_reason else exit_reason
         reason_enum = reason_map.get(clean_reason, ExitReason.MANUAL)
         
-        result = self._trader.close_position(
-            position_id=position_id,
-            exit_price=exit_price,
-            exit_reason=reason_enum
-        )
+        result = self._trader.close_position(position_id, exit_price, reason_enum)
         
         if result:
             return {
@@ -537,9 +470,7 @@ class LearningPaperTradingEngine:
                 'pnl_sol': result['pnl_sol'],
                 'hold_minutes': result['hold_minutes'],
                 'hold_duration_minutes': result['hold_minutes'],
-                'entry_hour_utc': result.get('entry_hour_utc'),
-                'exit_hour_utc': result.get('exit_hour_utc'),
-                'is_win': result['is_win']
+                'exit_reason': result['exit_reason']
             }
         return None
     
@@ -547,7 +478,7 @@ class LearningPaperTradingEngine:
         return self._trader.get_open_positions()
     
     def get_stats(self) -> Dict:
-        """Get trading statistics including learning info"""
+        """Get comprehensive trading statistics"""
         summary = self._trader.get_performance_summary()
         return {
             'balance': summary.get('balance', 0),
@@ -557,66 +488,116 @@ class LearningPaperTradingEngine:
             'open_positions': summary.get('open_positions', 0),
             'total_trades': summary.get('total_trades', 0),
             'win_rate': summary.get('win_rate', 0),
-            'profit_factor': 0,
-            'phase': summary.get('phase', 'exploration'),
-            'iteration': summary.get('iteration', 0),
-            'blocked_hours': summary.get('blocked_hours', []),
-            'preferred_hours': summary.get('preferred_hours', []),
-            'min_conviction': summary.get('min_conviction', 30),
-            'min_wallet_wr': summary.get('min_wallet_wr', 0.40)
+            'winning_trades': summary.get('winning_trades', 0),
+            # Learning-related (for backwards compatibility)
+            'phase': 'learning',
+            'iteration': 0,
+            'blocked_hours': [],
+            'preferred_hours': [],
         }
     
+    def get_baseline_comparison(self, days: int = 7) -> Dict:
+        """Get baseline comparison report"""
+        if self.baseline_tracker:
+            return self.baseline_tracker.get_comparison_report(days)
+        return {}
+    
+    def print_baseline_comparison(self, days: int = 7):
+        """Print baseline comparison report"""
+        if self.baseline_tracker:
+            self.baseline_tracker.print_comparison(days)
+    
+    def create_ab_test(self, name: str, variant_a: Dict, variant_b: Dict,
+                      min_samples: int = 30) -> str:
+        """Create a new A/B test"""
+        if self.ab_testing:
+            return self.ab_testing.create_test(name, variant_a, variant_b, min_samples=min_samples)
+        return ""
+    
+    def get_ab_test_status(self, test_id: str) -> Dict:
+        """Get A/B test status"""
+        if self.ab_testing:
+            return self.ab_testing.evaluate_test(test_id)
+        return {}
+    
+    def get_active_ab_tests(self) -> List[str]:
+        """Get list of active A/B test IDs"""
+        if self.ab_testing:
+            return list(self.ab_testing._active_tests.keys())
+        return []
+    
+    def run_backtest(self, strategy_func, days: int = 7) -> Dict:
+        """Run backtest on historical data"""
+        if self.historical_store:
+            from datetime import datetime, timedelta
+            return self.historical_store.backtest(
+                strategy_func,
+                start_date=datetime.utcnow() - timedelta(days=days)
+            )
+        return {}
+    
     def should_run_learning(self) -> bool:
-        """Check if it's time to run learning"""
+        """Check if it's time to run learning analysis"""
         hours_since = (datetime.utcnow() - self._last_learning).total_seconds() / 3600
-        return hours_since >= self._trader.config.learning_interval_hours
+        return hours_since >= 6.0
     
     def run_learning(self, force: bool = False, notifier=None) -> Dict:
-        """Run learning iteration"""
+        """Run learning analysis (baseline comparison + insights)"""
         if not force and not self.should_run_learning():
             return {'status': 'skipped', 'reason': 'not time yet'}
         
         self._last_learning = datetime.utcnow()
-        results = self._trader.run_learning_iteration(force=True)
         
-        if notifier and hasattr(notifier, 'send_learning_alert'):
-            try:
-                notifier.send_learning_alert(results)
-            except Exception as e:
-                print(f"  ⚠️ Learning notification error: {e}")
+        results = {
+            'status': 'completed',
+            'timestamp': datetime.utcnow().isoformat(),
+        }
+        
+        # Get baseline comparison
+        if self.baseline_tracker:
+            results['baseline_comparison'] = self.get_baseline_comparison()
+            
+            # Send report via Telegram
+            if notifier and hasattr(notifier, 'send_baseline_report'):
+                try:
+                    notifier.send_baseline_report(results['baseline_comparison'])
+                except Exception as e:
+                    print(f"  ⚠️ Baseline notification error: {e}")
+        
+        # Check A/B tests
+        if self.ab_testing:
+            results['ab_tests'] = {}
+            for test_id in self.get_active_ab_tests():
+                results['ab_tests'][test_id] = self.get_ab_test_status(test_id)
         
         return results
     
     def get_diurnal_report(self) -> Dict:
-        """Get time-of-day performance report"""
-        return self._trader.get_diurnal_report()
+        """Get time-of-day performance report (placeholder for compatibility)"""
+        return {}
     
     def get_strategy_feedback(self) -> Dict:
         """Get detailed feedback for strategy improvement"""
         return {
-            'summary': self._trader.get_performance_summary(),
-            'diurnal': self._trader.get_diurnal_report(),
-            'config': {
-                'phase': self._trader.config.current_phase,
-                'iteration': self._trader.config.iteration_count,
-                'min_conviction': self._trader.config.min_conviction_score,
-                'min_wallet_wr': self._trader.config.min_wallet_win_rate,
-                'blocked_hours': self._trader.config.blocked_hours_utc,
-                'preferred_hours': self._trader.config.preferred_hours_utc
-            }
+            'summary': self.get_stats(),
+            'baseline': self.get_baseline_comparison() if self.baseline_tracker else {},
+            'ab_tests': {tid: self.get_ab_test_status(tid) for tid in self.get_active_ab_tests()}
         }
     
     def print_status(self):
         self._trader.print_status()
     
     def stop(self):
-        self._trader.stop_monitor()
+        self._trader.stop()
 
 
+# ============================================================================
+# TRADING SYSTEM
+# ============================================================================
 class TradingSystem:
     def __init__(self):
         print("\n" + "="*70)
-        print("🚀 TRADING SYSTEM V2 (LEARNING MODE)")
+        print("🚀 TRADING SYSTEM V2 - ROBUST PAPER TRADING PLATFORM")
         print("="*70)
         
         self.helius_key = os.getenv('HELIUS_KEY')
@@ -635,16 +616,14 @@ class TradingSystem:
         self.notifier = Notifier()
         print(f"  {'✅' if self.notifier.enabled else '⚠️'} Telegram: {'enabled' if self.notifier.enabled else 'disabled'}")
         
-        # ====================================================================
-        # CHANGE 3: Use Learning Paper Trading Engine
-        # ====================================================================
+        # Initialize Robust Paper Trading Engine
         if CONFIG.paper_trading_enabled:
-            self.paper_engine = LearningPaperTradingEngine(
+            self.paper_engine = RobustPaperTradingEngine(
                 self.db, 
                 starting_balance=CONFIG.paper_starting_balance,
                 max_positions=CONFIG.max_open_positions
             )
-            print(f"  ✅ Learning Paper Trading (Balance: {self.paper_engine.balance:.2f} SOL)")
+            print(f"  ✅ Robust Paper Trading (Balance: {self.paper_engine.balance:.2f} SOL)")
         else:
             self.paper_engine = None
         
@@ -680,7 +659,7 @@ class TradingSystem:
         self.start_time = datetime.now()
         
         print("\n" + "="*70)
-        print("✅ TRADING SYSTEM V2 (LEARNING MODE) READY")
+        print("✅ ROBUST PAPER TRADING PLATFORM READY")
         print("="*70)
         self._print_status()
     
@@ -697,15 +676,13 @@ class TradingSystem:
         if self.paper_engine:
             stats = self.paper_engine.get_stats()
             print(f"  Paper: {stats['balance']:.2f} SOL ({stats['return_pct']:+.1f}%) | {stats['open_positions']} open")
-            print(f"  Learning Phase: {stats.get('phase', 'N/A')} | Iteration: {stats.get('iteration', 0)}")
-            blocked = stats.get('blocked_hours', [])
-            if blocked:
-                print(f"  Blocked Hours: {blocked}")
+            print(f"  Features: Watchdog={'✅' if CONFIG.enable_watchdog else '❌'} | "
+                  f"Baseline={'✅' if CONFIG.enable_baseline_tracking else '❌'} | "
+                  f"Historical={'✅' if CONFIG.enable_historical_storage else '❌'}")
         
         rate_stats = self.rate_limiter.get_stats()
         print(f"  Rate limit: {rate_stats['calls_last_hour']}/{rate_stats['limit_per_hour']} calls/hr")
         
-        # DEBUG: Webhook breakdown
         d = self.diagnostics
         print(f"\n📈 Webhook Breakdown:")
         print(f"  Total received: {d.webhooks_received}")
@@ -718,64 +695,64 @@ class TradingSystem:
         print(f"  Signals: {d.buy_signals_detected} BUY | {d.sell_signals_detected} SELL")
         print(f"  Token info failures: {d.token_info_failures}")
         print(f"  Positions opened: {d.positions_opened}")
-        
-        print(f"\n📋 Discovery Config:")
-        print(f"  Interval: {CONFIG.discovery_interval_hours}h")
-        print(f"  Budget: {CONFIG.discovery_api_budget:,} credits")
-        print(f"  Max wallets/day: {discovery_config.max_new_wallets_per_day}")
-        print(f"  Max total wallets: {discovery_config.max_total_wallets}")
+        print(f"  Cluster signals: {d.cluster_signals_detected}")
     
-    def process_webhook(self, tx: Dict) -> Dict:
-        signature = tx.get('signature', '')
-        tx_type = tx.get('type', '')
-        fee_payer = tx.get('feePayer', '')
-        
+    def process_webhook(self, data: Dict) -> Dict:
+        """Process incoming Helius webhook"""
         self.diagnostics.webhooks_received += 1
         self.diagnostics.last_webhook_received = datetime.now()
         
-        result = {'processed': False, 'action': None, 'reason': ''}
+        result = {'processed': False, 'reason': ''}
         
-        if not self.db.is_wallet_tracked(fee_payer):
-            self.diagnostics.webhooks_skipped += 1
-            self.diagnostics.untracked_wallet_skips += 1
-            result['reason'] = 'Wallet not tracked'
-            return result
+        try:
+            txs = data if isinstance(data, list) else [data]
+            
+            for tx in txs:
+                try:
+                    self._process_transaction(tx)
+                    self.diagnostics.webhooks_processed += 1
+                except Exception as e:
+                    self.diagnostics.parse_failures += 1
+                    self.diagnostics.log_event('PARSE_ERROR', str(e)[:100])
+            
+            result['processed'] = True
+            
+        except Exception as e:
+            result['reason'] = str(e)
+            self.diagnostics.log_event('WEBHOOK_ERROR', str(e)[:100])
         
-        if self.db.is_signature_processed(signature):
-            self.diagnostics.webhooks_skipped += 1
-            self.diagnostics.duplicate_sig_skips += 1
-            result['reason'] = 'Already processed'
-            return result
+        return result
+    
+    def _process_transaction(self, tx: Dict):
+        """Process a single transaction"""
+        fee_payer = tx.get('feePayer', '')
+        signature = tx.get('signature', '')
         
-        if tx_type != 'SWAP':
-            self.diagnostics.webhooks_skipped += 1
-            self.diagnostics.non_swap_skips += 1
-            result['reason'] = f'Not a swap: {tx_type}'
-            return result
+        if not fee_payer or not signature:
+            return
         
-        trade = self._parse_webhook_swap(tx, fee_payer)
-        
-        if not trade:
-            self.diagnostics.webhooks_skipped += 1
-            self.diagnostics.parse_failures += 1
-            result['reason'] = 'Could not parse trade'
-            return result
-        
-        token_addr = trade['token_address']
-        
-        if self.historian.scanner.is_ignored_token(token_addr):
-            self.db.mark_signature_processed(signature, fee_payer, trade['type'], token_addr)
-            self.diagnostics.webhooks_skipped += 1
-            result['reason'] = 'Ignored token'
-            return result
-        
-        self.db.mark_signature_processed(signature, fee_payer, trade['type'], token_addr)
-        self.diagnostics.webhooks_processed += 1
-        
+        # Check if tracked wallet
         wallet_data = self.db.get_wallet(fee_payer)
         if not wallet_data:
-            result['reason'] = 'Wallet data not found'
-            return result
+            self.diagnostics.untracked_wallet_skips += 1
+            return
+        
+        # Check for duplicate
+        if self.db.is_signature_processed(signature):
+            self.diagnostics.duplicate_sig_skips += 1
+            return
+        
+        # Parse as swap
+        trade = self._parse_swap(tx)
+        if not trade:
+            self.diagnostics.non_swap_skips += 1
+            return
+        
+        self.db.mark_signature_processed(signature)
+        
+        token_addr = trade.get('token_out') if trade['type'] == 'BUY' else trade.get('token_in')
+        if not token_addr:
+            return
         
         self.diagnostics.log_event('TRADE_DETECTED', f"{trade['type']} from {fee_payer[:8]}...")
         
@@ -785,10 +762,65 @@ class TradingSystem:
         elif trade['type'] == 'SELL':
             self.diagnostics.sell_signals_detected += 1
             return self._process_sell(trade, wallet_data, token_addr, fee_payer)
+    
+    def _parse_swap(self, tx: Dict) -> Optional[Dict]:
+        """Parse transaction as a swap"""
+        instructions = tx.get('instructions', [])
+        token_transfers = tx.get('tokenTransfers', [])
         
-        return result
+        if not token_transfers:
+            return None
+        
+        is_swap = any('swap' in str(instr).lower() for instr in instructions)
+        
+        if not is_swap and len(token_transfers) < 2:
+            return None
+        
+        sol_mint = "So11111111111111111111111111111111111111112"
+        fee_payer = tx.get('feePayer', '')
+        
+        sol_in = None
+        sol_out = None
+        token_in = None
+        token_out = None
+        
+        for transfer in token_transfers:
+            mint = transfer.get('mint', '')
+            from_addr = transfer.get('fromUserAccount', '')
+            to_addr = transfer.get('toUserAccount', '')
+            amount = float(transfer.get('tokenAmount', 0))
+            
+            if amount <= 0:
+                continue
+            
+            if mint == sol_mint:
+                if from_addr == fee_payer:
+                    sol_out = amount
+                elif to_addr == fee_payer:
+                    sol_in = amount
+            else:
+                if from_addr == fee_payer:
+                    token_in = mint
+                elif to_addr == fee_payer:
+                    token_out = mint
+        
+        if sol_out and token_out:
+            return {'type': 'BUY', 'token_out': token_out, 'sol_spent': sol_out}
+        elif sol_in and token_in:
+            return {'type': 'SELL', 'token_in': token_in, 'sol_received': sol_in}
+        
+        return None
     
     def _process_buy(self, trade: Dict, wallet_data: Dict, token_addr: str, signature: str) -> Dict:
+        """
+        Process a BUY signal through the full robust pipeline.
+        
+        Uses:
+        - Signal Quality Analysis (cluster detection, timing, sizing)
+        - Dynamic Exit Parameters
+        - Baseline Comparison Recording
+        - Historical Storage
+        """
         result = {'processed': True, 'action': 'BUY_SIGNAL', 'reason': ''}
         
         if self.db.is_position_tracked(wallet_data['address'], token_addr):
@@ -816,752 +848,481 @@ class TradingSystem:
             result['reason'] = 'Invalid price'
             return result
         
+        # Normalize wallet win rate
+        wallet_wr = wallet_data.get('win_rate', 0.5)
+        if wallet_wr > 1:
+            wallet_wr = wallet_wr / 100.0
+        
+        # Handle liquidity field
+        liquidity = token_info.get('liquidity', 0)
+        if isinstance(liquidity, dict):
+            liquidity = liquidity.get('usd', 0)
+        liquidity = float(liquidity or 0)
+        
+        # Build signal data
         signal_data = {
             'token_address': token_addr,
             'token_symbol': token_info.get('symbol', 'UNKNOWN'),
             'price': price,
-            'liquidity': token_info.get('liquidity', 0),  # Fixed: was 'liquidity_usd'
+            'liquidity': liquidity,
             'volume_24h': token_info.get('volume_24h', 0),
             'market_cap': token_info.get('market_cap', 0),
             'token_age_hours': token_info.get('age_hours', 0),
             'holder_count': token_info.get('holder_count', 0),
             'wallet': wallet_data['address'],
-            'wallet_win_rate': wallet_data.get('win_rate', 0.5),
+            'wallet_address': wallet_data['address'],
+            'wallet_win_rate': wallet_wr,
             'wallet_cluster': wallet_data.get('cluster', 'UNKNOWN')
         }
         
+        # Build wallet data for quality analysis
+        wallet_info = {
+            'address': wallet_data['address'],
+            'win_rate': wallet_wr,
+            'cluster': wallet_data.get('cluster', 'UNKNOWN'),
+            'roi_7d': wallet_data.get('roi_7d', 0),
+            'trades_count': wallet_data.get('total_trades', 0),
+            'avg_position_size_sol': wallet_data.get('avg_position_size', 0),
+        }
+        
+        # Update top wallets periodically
+        if self.paper_engine:
+            self.paper_engine.update_top_wallets(self.db)
+        
         # ====================================================================
-        # LEARNING MODE: Bypass strict strategist filters, be PERMISSIVE
+        # PROCESS THROUGH ROBUST PIPELINE
         # ====================================================================
-        if self.paper_engine and hasattr(self.paper_engine, '_trader'):
-            # We're in learning mode - use relaxed criteria
-            wallet_wr = wallet_data.get('win_rate', 0.5)
-            # Normalize win rate (might be stored as 0.65 or 65)
-            if wallet_wr > 1:
-                wallet_wr = wallet_wr / 100.0
-            
-            # Handle multiple possible liquidity field names from DexScreener
-            liquidity = token_info.get('liquidity', 0)
-            if isinstance(liquidity, dict):
-                liquidity = liquidity.get('usd', 0)
-            liquidity = float(liquidity or 0)
-            
-            # Update signal_data with correct liquidity for open_position
-            signal_data['liquidity'] = liquidity
-            signal_data['wallet_win_rate'] = wallet_wr
-            
-            # DEBUG: Print what we got from token_info
-            print(f"  📊 Token Info: ${signal_data['token_symbol']}")
-            print(f"     Price: ${price:.8f}")
-            print(f"     Liquidity: ${liquidity:,.0f}")
-            print(f"     Wallet WR: {wallet_wr:.0%}")
-            
-            # LEARNING MODE FILTERS (EXTREMELY permissive):
-            # - Just need a valid price
-            # - Wallet win rate >= 30% (very low bar)
-            # - NO liquidity filter - we want to LEARN if liquidity matters
-            
-            should_enter_learning = (
-                price > 0 and
-                wallet_wr >= 0.30  # Very relaxed threshold
-            )
-            
-            if should_enter_learning:
-                # Build a permissive decision for learning
-                conviction = 50 + (wallet_wr * 40)  # 50-90 based on wallet WR
-                
-                decision = {
-                    'should_enter': True,
-                    'conviction_score': conviction,
-                    'position_size_sol': 0.3,  # Fixed small size for learning
-                    'stop_loss': -0.15,  # 15% stop loss
-                    'take_profit': 0.30,  # 30% take profit
-                    'trailing_stop': 0.10,  # 10% trailing
-                    'max_hold_hours': 12,
-                    'regime': self.strategist.regime_detector.current_regime,
-                    'wallet_count': 1,
-                    'reason': f'LEARNING MODE: WR={wallet_wr:.0%}, Liq=${liquidity:,.0f}',
-                    'llm_called': False,
-                    'learning_mode': True
-                }
-                
-                print(f"\n  🎓 LEARNING MODE: Opening position for ${signal_data['token_symbol']}")
-                print(f"     Wallet WR: {wallet_wr:.0%} | Liquidity: ${liquidity:,.0f}")
-                
-                pos_id = self.paper_engine.open_position(signal_data, decision, price)
-                
-                if pos_id:
-                    self.diagnostics.positions_opened += 1
-                    print(f"     ✅ POSITION OPENED (ID: {pos_id})")
-                    
-                    if self.notifier:
-                        self.notifier.send_entry_alert(signal_data, decision)
-                    
-                    result['action'] = 'POSITION_OPENED'
-                    result['position_id'] = pos_id
-                    return result
-                else:
-                    print(f"     ⚠️ Position open failed")
-            else:
-                skip_reason = []
-                if price <= 0:
-                    skip_reason.append(f'No price')
-                if wallet_wr < 0.30:
-                    skip_reason.append(f'Low WR: {wallet_wr:.0%}')
-                print(f"  ⏭️ LEARNING SKIP: {', '.join(skip_reason)}")
-                result['reason'] = f"Learning filter: {', '.join(skip_reason)}"
+        if self.paper_engine:
+            # Check minimum wallet WR (very permissive for learning)
+            if wallet_wr < 0.30:
+                print(f"  ⏭️ SKIP: Low WR ({wallet_wr:.0%} < 30%)")
+                result['reason'] = f"Low wallet WR: {wallet_wr:.0%}"
                 return result
-        
-        # ====================================================================
-        # NORMAL MODE: Use strategist (for when not in learning)
-        # ====================================================================
-        decision = self.strategist.analyze_signal(signal_data, wallet_data, use_llm=CONFIG.use_llm)
-        
-        if decision.get('llm_called'):
-            self.diagnostics.llm_calls += 1
-        
-        if decision.get('should_enter') and self.paper_engine:
-            pos_id = self.paper_engine.open_position(signal_data, decision, price)
             
-            if pos_id:
-                self.diagnostics.positions_opened += 1
-                print(f"  📥 Position opened: ${token_info.get('symbol', '?')} (ID: {pos_id})")
-                
+            # Process through full pipeline
+            process_result = self.paper_engine.process_signal(signal_data, wallet_info)
+            
+            # Track quality metrics in diagnostics
+            quality_metrics = process_result.get('quality_metrics', {})
+            if quality_metrics.get('is_cluster_signal'):
+                self.diagnostics.cluster_signals_detected += 1
+                # Send cluster alert
                 if self.notifier:
-                    self.notifier.send_entry_alert(signal_data, decision)
+                    self.notifier.send_cluster_alert(
+                        signal_data['token_symbol'],
+                        quality_metrics.get('concurrent_wallet_count', 1),
+                        quality_metrics.get('cluster_wallets', [])
+                    )
+            
+            conviction = process_result.get('conviction', 50)
+            if conviction >= 70:
+                self.diagnostics.high_conviction_signals += 1
+            
+            if self.paper_engine.baseline_tracker:
+                self.diagnostics.baseline_signals_recorded += 1
+            
+            # Log the processing
+            print(f"\n  🎯 SIGNAL: ${signal_data['token_symbol']}")
+            print(f"     Price: ${price:.8f} | Liquidity: ${liquidity:,.0f}")
+            print(f"     Wallet WR: {wallet_wr:.0%} | Conviction: {conviction:.0f}")
+            print(f"     Quality: {process_result.get('quality_score', 50):.0f} | "
+                  f"Cluster: {'🔥 YES' if quality_metrics.get('is_cluster_signal') else 'No'}")
+            
+            # Check if position was opened
+            if process_result.get('position_id'):
+                pos_id = process_result['position_id']
+                self.diagnostics.positions_opened += 1
+                
+                # Get exit params for display
+                exit_params = process_result.get('exit_params', {})
+                print(f"     ✅ POSITION OPENED (ID: {pos_id})")
+                print(f"     Stop: {exit_params.get('stop_loss_pct', -15):.0f}% | "
+                      f"TP: {exit_params.get('take_profit_pct', 30):.0f}%")
+                
+                # Send entry notification
+                if self.notifier:
+                    decision = {
+                        'conviction_score': conviction,
+                        'wallet_count': quality_metrics.get('concurrent_wallet_count', 1),
+                        'regime': self.strategist.regime_detector.current_regime,
+                        'position_size_sol': 0.3,
+                        'stop_loss_pct': exit_params.get('stop_loss_pct', -15),
+                        'take_profit_pct': exit_params.get('take_profit_pct', 30),
+                    }
+                    
+                    # Create quality metrics object for notification
+                    quality_obj = SignalQualityMetrics(
+                        is_cluster_signal=quality_metrics.get('is_cluster_signal', False),
+                        concurrent_wallet_count=quality_metrics.get('concurrent_wallet_count', 1)
+                    )
+                    
+                    self.notifier.send_entry_alert(signal_data, decision, quality_obj)
                 
                 result['action'] = 'POSITION_OPENED'
                 result['position_id'] = pos_id
-        else:
-            result['action'] = 'SKIPPED'
-            result['reason'] = decision.get('reason', 'Did not meet criteria')
+                result['quality'] = process_result.get('quality_score', 50)
+                result['conviction'] = conviction
+                
+            else:
+                print(f"     ⚠️ Position not opened")
+                result['reason'] = 'Position open criteria not met'
         
         return result
     
-    def _process_sell(self, trade: Dict, wallet_data: Dict, token_addr: str, wallet: str) -> Dict:
-        result = {'processed': True, 'action': 'SELL_SIGNAL', 'reason': ''}
-        
-        if not self.rate_limiter.can_call():
-            return result
-        
-        self.rate_limiter.record_call()
-        self.diagnostics.api_calls_made += 1
-        
-        token_info = self.historian.scanner.get_token_info(token_addr)
-        token_symbol = token_info.get('symbol', 'UNKNOWN') if token_info else 'UNKNOWN'
-        price = token_info.get('price_usd', 0) if token_info else 0
-        
-        exit_recommendation = self.strategist.process_exit_signal(token_addr, token_symbol, wallet, price)
-        
-        if exit_recommendation and exit_recommendation.get('action') in ['FULL_EXIT', 'PARTIAL_EXIT']:
-            print(f"\n  ⚠️ EXIT SIGNAL: {exit_recommendation.get('reason')}")
-            
-            if self.paper_engine:
-                positions = self.paper_engine.get_open_positions()
-                token_positions = [p for p in positions if p.get('token_address') == token_addr]
-                
-                for pos in token_positions:
-                    if exit_recommendation.get('action') == 'FULL_EXIT':
-                        self._close_position(pos, f"EXIT_SIGNAL: {exit_recommendation.get('reason')}", price)
-        
+    def _process_sell(self, trade: Dict, wallet_data: Dict, token_addr: str, wallet_addr: str) -> Dict:
+        """Process a sell signal"""
+        result = {'processed': True, 'action': 'SELL_SIGNAL'}
+        # Sells are tracked but don't trigger paper trades
         return result
-    
-    def _close_position(self, position: Dict, reason: str, price: float):
-        """Close position with FIXED notification (passes result for accurate hold time)"""
-        if self.paper_engine:
-            result = self.paper_engine.close_position(position['id'], reason, price)
-            
-            if result:
-                self.diagnostics.positions_closed += 1
-                print(f"  📤 CLOSED: ${position.get('token_symbol', '?')} | {result['pnl_pct']:+.1f}% | Hold: {result['hold_minutes']:.0f}m")
-                
-                # ============================================================
-                # CHANGE 4: Pass result to send_exit_alert for accurate hold time
-                # ============================================================
-                if self.notifier:
-                    self.notifier.send_exit_alert(position, reason, result['pnl_pct'], result)
-    
-    def _parse_webhook_swap(self, tx: Dict, wallet: str) -> Optional[Dict]:
-        try:
-            token_transfers = tx.get('tokenTransfers', [])
-            native_transfers = tx.get('nativeTransfers', [])
-            
-            tokens_in = {}
-            tokens_out = {}
-            sol_in = 0
-            sol_out = 0
-            
-            SOL_MINT = "So11111111111111111111111111111111111111112"
-            
-            for t in token_transfers:
-                mint = t.get('mint', '')
-                if mint == SOL_MINT:
-                    continue
-                amount = t.get('tokenAmount', 0)
-                if t.get('toUserAccount') == wallet:
-                    tokens_in[mint] = tokens_in.get(mint, 0) + amount
-                elif t.get('fromUserAccount') == wallet:
-                    tokens_out[mint] = tokens_out.get(mint, 0) + amount
-            
-            for t in native_transfers:
-                amount = t.get('amount', 0) / 1e9
-                if t.get('toUserAccount') == wallet:
-                    sol_in += amount
-                elif t.get('fromUserAccount') == wallet:
-                    sol_out += amount
-            
-            if len(tokens_in) == 1 and sol_out > 0:
-                token_addr = list(tokens_in.keys())[0]
-                return {'type': 'BUY', 'token_address': token_addr, 'amount': tokens_in[token_addr], 'sol_amount': sol_out}
-            
-            if len(tokens_out) == 1 and sol_in > 0:
-                token_addr = list(tokens_out.keys())[0]
-                return {'type': 'SELL', 'token_address': token_addr, 'amount': tokens_out[token_addr], 'sol_amount': sol_in}
-            
-            return None
-        except Exception:
-            return None
-    
-    def check_open_positions(self):
-        if not self.paper_engine:
-            return
-        
-        positions = self.paper_engine.get_open_positions()
-        if not positions:
-            return
-        
-        print(f"\n🔍 Checking {len(positions)} open position(s)...")
-        
-        for position in positions:
-            if not self.rate_limiter.can_call():
-                print("  ⚠️ Rate limited - will check remaining next cycle")
-                break
-            
-            self.rate_limiter.record_call()
-            self.diagnostics.api_calls_made += 1
-            
-            token_info = self.historian.scanner.get_token_info(position.get('token_address', ''))
-            if not token_info:
-                continue
-            
-            current_price = token_info.get('price_usd', 0)
-            if current_price <= 0:
-                continue
-            
-            exit_reason = self.paper_engine.check_exit_conditions(position, current_price)
-            if exit_reason:
-                self._close_position(position, exit_reason, current_price)
     
     def run_discovery(self) -> Dict:
-        """Run discovery with proper budget from config"""
+        """Run discovery cycle"""
         if not self.historian:
-            return {'error': 'Discovery not enabled'}
+            return {'status': 'disabled'}
         
-        self.diagnostics.discoveries_run += 1
-        
-        current_count = self.db.get_wallet_count()
-        max_wallets = discovery_config.get_max_wallets_this_cycle(current_count)
-        api_budget = discovery_config.max_api_calls_per_discovery
-        
-        print(f"\n   📋 Discovery parameters:")
-        print(f"      API Budget: {api_budget:,} credits")
-        print(f"      Max wallets this cycle: {max_wallets}")
-        print(f"      Current wallet count: {current_count}/{discovery_config.max_total_wallets}")
-        
-        stats = self.historian.run_discovery(
-            max_wallets=max_wallets,
-            api_budget=api_budget
-        )
-        
-        if stats.get('wallets_verified', 0) > 0:
-            self.diagnostics.wallets_discovered += stats['wallets_verified']
-        
-        return stats
-    
-    def get_diagnostics(self) -> Dict:
-        diag = self.diagnostics.to_dict()
-        diag['rate_limiter'] = self.rate_limiter.get_stats()
-        diag['strategist'] = self.strategist.get_status()
-        diag['llm_cost_today'] = self.strategist.get_llm_cost_today()
-        diag['discovery_config'] = {
-            'interval_hours': CONFIG.discovery_interval_hours,
-            'api_budget': CONFIG.discovery_api_budget,
-            'max_wallets_per_day': discovery_config.max_new_wallets_per_day,
-            'max_total_wallets': discovery_config.max_total_wallets
-        }
-        
-        if self.paper_engine:
-            diag['paper_trading'] = self.paper_engine.get_stats()
-            diag['learning'] = {
-                'phase': diag['paper_trading'].get('phase'),
-                'iteration': diag['paper_trading'].get('iteration'),
-                'blocked_hours': diag['paper_trading'].get('blocked_hours'),
-                'preferred_hours': diag['paper_trading'].get('preferred_hours')
-            }
-        
-        return diag
+        try:
+            self.diagnostics.discoveries_run += 1
+            result = self.historian.run_discovery()
+            
+            new_wallets = result.get('wallets_added', 0)
+            self.diagnostics.wallets_discovered += new_wallets
+            
+            return result
+        except Exception as e:
+            return {'status': 'error', 'error': str(e)}
 
 
-# Global instance
-trading_system: Optional[TradingSystem] = None
+# ============================================================================
+# FLASK APP
+# ============================================================================
 app = Flask(__name__)
+trading_system: TradingSystem = None
 
 
 @app.route('/webhook/helius', methods=['POST'])
 def helius_webhook():
     global trading_system
-    
     if not trading_system:
-        return jsonify({"status": "error", "message": "System not initialized"}), 500
+        return jsonify({'error': 'System not initialized'}), 503
     
-    try:
-        data = request.json
-        transactions = data if isinstance(data, list) else [data]
-        results = []
-        
-        for tx in transactions:
-            signature = tx.get('signature', '')[:16]
-            tx_type = tx.get('type', 'UNKNOWN')
-            fee_payer = tx.get('feePayer', '')[:8]
-            
-            print(f"\n📩 WEBHOOK: {tx_type} from {fee_payer}... (sig: {signature}...)")
-            
-            result = trading_system.process_webhook(tx)
-            results.append(result)
-            
-            if result.get('processed'):
-                print(f"   ✅ {result.get('action', 'PROCESSED')}")
-            else:
-                print(f"   ⭕ Skipped: {result.get('reason', 'Unknown')}")
-        
-        return jsonify({"status": "success", "results": results}), 200
-    except Exception as e:
-        print(f"❌ Webhook error: {e}")
-        import traceback
-        traceback.print_exc()
-        return jsonify({"status": "error", "message": str(e)}), 500
+    data = request.get_json()
+    if not data:
+        return jsonify({'error': 'No data'}), 400
+    
+    result = trading_system.process_webhook(data)
+    return jsonify(result)
 
 
-# ============================================================================
-# CHANGE 6: Updated /status endpoint with learning info
-# ============================================================================
 @app.route('/status', methods=['GET'])
 def status():
     global trading_system
     if not trading_system:
-        return jsonify({"status": "not_initialized"}), 500
+        return jsonify({'error': 'System not initialized'}), 503
     
-    stats = trading_system.paper_engine.get_stats() if trading_system.paper_engine else {}
+    stats = {}
+    if trading_system.paper_engine:
+        stats = trading_system.paper_engine.get_stats()
+    
+    regime = trading_system.strategist.get_status()
     
     return jsonify({
-        "status": "running",
-        "uptime_hours": trading_system.diagnostics.to_dict()['uptime_hours'],
-        "paper_trading": {
-            "balance": stats.get('balance', 0),
-            "return_pct": stats.get('return_pct', 0),
-            "open_positions": stats.get('open_positions', 0),
-            "total_trades": stats.get('total_trades', 0),
-            "win_rate": stats.get('win_rate', 0)
-        },
-        "learning": {
-            "phase": stats.get('phase'),
-            "iteration": stats.get('iteration'),
-            "blocked_hours": stats.get('blocked_hours'),
-            "preferred_hours": stats.get('preferred_hours')
+        'status': 'running',
+        'uptime_hours': (datetime.now() - trading_system.start_time).total_seconds() / 3600,
+        'wallets_tracked': trading_system.db.get_wallet_count(),
+        'regime': regime,
+        'paper_trading': stats,
+        'features': {
+            'watchdog': CONFIG.enable_watchdog,
+            'baseline_tracking': CONFIG.enable_baseline_tracking,
+            'historical_storage': CONFIG.enable_historical_storage,
         }
-    }), 200
+    })
 
 
 @app.route('/diagnostics', methods=['GET'])
 def diagnostics():
     global trading_system
     if not trading_system:
-        return jsonify({"status": "not_initialized"}), 500
-    return jsonify(trading_system.get_diagnostics()), 200
+        return jsonify({'error': 'System not initialized'}), 503
+    
+    return jsonify(trading_system.diagnostics.to_dict())
 
 
 @app.route('/positions', methods=['GET'])
 def positions():
     global trading_system
     if not trading_system or not trading_system.paper_engine:
-        return jsonify([]), 200
-    return jsonify(trading_system.paper_engine.get_open_positions()), 200
+        return jsonify({'error': 'Paper trading not enabled'}), 503
+    
+    positions = trading_system.paper_engine.get_open_positions()
+    return jsonify({
+        'count': len(positions),
+        'positions': positions
+    })
 
 
 @app.route('/new_wallets', methods=['GET'])
 def new_wallets():
     global trading_system
     if not trading_system:
-        return jsonify([]), 200
+        return jsonify({'error': 'System not initialized'}), 503
     
-    with trading_system.db.connection() as conn:
-        rows = conn.execute("""
-            SELECT address, discovered_at, win_rate, pnl_7d
-            FROM verified_wallets
-            WHERE discovered_at >= datetime('now', '-24 hours')
-            ORDER BY discovered_at DESC
-        """).fetchall()
-        return jsonify([dict(r) for r in rows]), 200
-
-
-@app.route('/test', methods=['GET', 'POST'])
-def test_endpoint():
-    return jsonify({"status": "ok", "message": "Server is running", "timestamp": datetime.now().isoformat()}), 200
+    hours = request.args.get('hours', 24, type=int)
+    wallets = trading_system.db.get_recent_wallets(hours=hours)
+    return jsonify({'count': len(wallets), 'wallets': wallets})
 
 
 @app.route('/discovery/run', methods=['POST'])
-def trigger_discovery():
-    """Manually trigger a discovery run"""
+def run_discovery():
     global trading_system
     if not trading_system:
-        return jsonify({"status": "error", "message": "System not initialized"}), 500
+        return jsonify({'error': 'System not initialized'}), 503
     
-    try:
-        stats = trading_system.run_discovery()
-        return jsonify({"status": "success", "stats": stats}), 200
-    except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
+    result = trading_system.run_discovery()
+    return jsonify(result)
 
 
 @app.route('/learning/run', methods=['POST'])
-def trigger_learning():
-    """Manually trigger the learning loop"""
+def run_learning():
     global trading_system
-    if not trading_system:
-        return jsonify({"status": "error", "message": "System not initialized"}), 500
+    if not trading_system or not trading_system.paper_engine:
+        return jsonify({'error': 'Paper trading not enabled'}), 503
     
-    try:
-        if trading_system.paper_engine:
-            result = trading_system.paper_engine.run_learning(force=True, notifier=trading_system.notifier)
-            trading_system.diagnostics.learning_iterations += 1
-            return jsonify({"status": "success", "result": result}), 200
-        else:
-            return jsonify({"status": "error", "message": "Paper trading not enabled"}), 400
-    except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
+    force = request.args.get('force', 'false').lower() == 'true'
+    result = trading_system.paper_engine.run_learning(force=force, notifier=trading_system.notifier)
+    return jsonify(result)
 
 
 @app.route('/learning/insights', methods=['GET'])
 def learning_insights():
-    """Get learning insights and strategy performance"""
     global trading_system
-    if not trading_system:
-        return jsonify({"status": "error", "message": "System not initialized"}), 500
+    if not trading_system or not trading_system.paper_engine:
+        return jsonify({'error': 'Paper trading not enabled'}), 503
     
-    try:
-        insights = trading_system.strategist.get_learning_insights()
-        
-        if trading_system.paper_engine:
-            insights['paper_trading_feedback'] = trading_system.paper_engine.get_strategy_feedback()
-        
-        return jsonify({"status": "success", "insights": insights}), 200
-    except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
+    return jsonify(trading_system.paper_engine.get_strategy_feedback())
 
 
 # ============================================================================
-# CHANGE 7: New /learning/diurnal endpoint
+# NEW ENDPOINTS FOR ROBUST PLATFORM
 # ============================================================================
-@app.route('/learning/diurnal', methods=['GET'])
-def diurnal_report():
-    """Get diurnal (time-of-day) performance report"""
+
+@app.route('/baseline', methods=['GET'])
+def baseline_comparison():
+    """Get baseline comparison report"""
     global trading_system
-    if not trading_system:
-        return jsonify({"status": "error", "message": "System not initialized"}), 500
+    if not trading_system or not trading_system.paper_engine:
+        return jsonify({'error': 'Paper trading not enabled'}), 503
     
-    try:
-        if trading_system.paper_engine:
-            report = trading_system.paper_engine.get_diurnal_report()
-            stats = trading_system.paper_engine.get_stats()
-            
-            return jsonify({
-                "status": "success",
-                "phase": stats.get('phase'),
-                "iteration": stats.get('iteration'),
-                "blocked_hours": stats.get('blocked_hours'),
-                "preferred_hours": stats.get('preferred_hours'),
-                "hourly_performance": report
-            }), 200
+    days = request.args.get('days', 7, type=int)
+    report = trading_system.paper_engine.get_baseline_comparison(days)
+    return jsonify(report)
+
+
+@app.route('/ab_test', methods=['GET', 'POST'])
+def ab_testing():
+    """A/B testing endpoint"""
+    global trading_system
+    if not trading_system or not trading_system.paper_engine:
+        return jsonify({'error': 'Paper trading not enabled'}), 503
+    
+    if request.method == 'POST':
+        # Create new A/B test
+        data = request.get_json()
+        if not data:
+            return jsonify({'error': 'No data provided'}), 400
+        
+        test_id = trading_system.paper_engine.create_ab_test(
+            name=data.get('name', 'Unnamed Test'),
+            variant_a=data.get('variant_a', {}),
+            variant_b=data.get('variant_b', {}),
+            min_samples=data.get('min_samples', 30)
+        )
+        return jsonify({'test_id': test_id, 'status': 'created'})
+    
+    else:
+        # Get A/B test status
+        test_id = request.args.get('test_id')
+        if test_id:
+            status = trading_system.paper_engine.get_ab_test_status(test_id)
+            return jsonify(status)
         else:
-            return jsonify({"status": "error", "message": "Paper trading not enabled"}), 400
-    except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
+            # Return all active tests
+            tests = trading_system.paper_engine.get_active_ab_tests()
+            return jsonify({'active_tests': tests})
+
+
+@app.route('/backtest', methods=['POST'])
+def run_backtest():
+    """Run backtest with custom strategy"""
+    global trading_system
+    if not trading_system or not trading_system.paper_engine:
+        return jsonify({'error': 'Paper trading not enabled'}), 503
+    
+    data = request.get_json() or {}
+    days = data.get('days', 7)
+    
+    # Default strategy: enter if wallet WR > 50%
+    def default_strategy(signal, quality):
+        wallet_wr = signal.get('wallet_win_rate', 0)
+        if wallet_wr > 1:
+            wallet_wr /= 100
+        return {
+            'enter': wallet_wr >= 0.5,
+            'exit_params': {
+                'stop_loss_pct': -15,
+                'take_profit_pct': 30,
+                'max_hold_hours': 12
+            }
+        }
+    
+    result = trading_system.paper_engine.run_backtest(default_strategy, days=days)
+    return jsonify(result)
+
+
+@app.route('/test', methods=['GET'])
+def test():
+    return jsonify({
+        'status': 'ok',
+        'message': 'Robust Paper Trading Platform is running!',
+        'features': {
+            'watchdog': CONFIG.enable_watchdog,
+            'baseline_tracking': CONFIG.enable_baseline_tracking,
+            'historical_storage': CONFIG.enable_historical_storage,
+            'ab_testing': CONFIG.enable_ab_testing,
+        }
+    })
 
 
 # ============================================================================
-# CHANGE 5: Updated background_tasks with learning loop
+# BACKGROUND TASKS
 # ============================================================================
 def background_tasks():
+    """Background task loop"""
     global trading_system
     
-    last_position_check = time.time()
-    last_status_print = time.time()
-    last_discovery = time.time() - 82800
-    last_learning = time.time() - 18000  # Start ~5h ago
+    last_discovery = datetime.now()
+    last_status = datetime.now()
+    last_learning = datetime.now()
     
     while True:
-        time.sleep(60)
-        
-        if not trading_system:
-            continue
-        
-        now = time.time()
-        
-        if now - last_position_check >= CONFIG.position_check_interval:
-            last_position_check = now
-            try:
-                trading_system.check_open_positions()
-            except Exception as e:
-                print(f"Position check error: {e}")
-        
-        discovery_interval = CONFIG.discovery_interval_hours * 3600
-        if now - last_discovery >= discovery_interval:
-            last_discovery = now
-            try:
-                stats = trading_system.run_discovery()
-                
-                wallets_added = stats.get('wallets_added_to_webhook', 0)
-                wallets_failed = stats.get('wallets_failed_webhook', 0)
-                
-                if wallets_added > 0:
-                    print(f"✅ {wallets_added} new wallet(s) discovered and added!")
-                if wallets_failed > 0:
-                    print(f"⚠️  {wallets_failed} wallet(s) failed to add - run 'python multi_webhook_manager.py sync' to retry")
-            except Exception as e:
-                print(f"Discovery error: {e}")
-                import traceback
-                traceback.print_exc()
-        
-        if now - last_status_print >= 1800:
-            last_status_print = now
-            trading_system._print_status()
+        try:
+            time.sleep(60)
             
-            if trading_system.paper_engine and trading_system.notifier:
-                trading_system.notifier.send_hourly_status(trading_system.diagnostics, trading_system.paper_engine.get_stats())
-        
-        # ====================================================================
-        # LEARNING LOOP - runs every 6 hours using paper engine's learning
-        # ====================================================================
-        learning_interval = 6 * 3600  # 6 hours
-        if now - last_learning >= learning_interval:
-            last_learning = now
-            try:
-                print("\n" + "="*70)
-                print("🎓 RUNNING LEARNING LOOP")
-                print("="*70)
+            if not trading_system:
+                continue
+            
+            now = datetime.now()
+            
+            # Hourly status
+            if (now - last_status).total_seconds() >= 3600:
+                last_status = now
                 
-                if trading_system.paper_engine:
-                    learning_result = trading_system.paper_engine.run_learning(
-                        force=True,
+                if trading_system.paper_engine and trading_system.notifier:
+                    stats = trading_system.paper_engine.get_stats()
+                    diag = trading_system.diagnostics.to_dict()
+                    trading_system.notifier.send_hourly_status(stats, diag, stats)
+            
+            # Discovery
+            if CONFIG.discovery_enabled:
+                hours_since = (now - last_discovery).total_seconds() / 3600
+                if hours_since >= CONFIG.discovery_interval_hours:
+                    last_discovery = now
+                    print(f"\n🔍 Running scheduled discovery...")
+                    trading_system.run_discovery()
+            
+            # Learning analysis (every 6 hours)
+            if trading_system.paper_engine:
+                if (now - last_learning).total_seconds() >= 6 * 3600:
+                    last_learning = now
+                    print(f"\n🧪 Running learning analysis...")
+                    trading_system.paper_engine.run_learning(
+                        force=True, 
                         notifier=trading_system.notifier
                     )
-                    
-                    if learning_result.get('status') == 'completed':
-                        trading_system.diagnostics.learning_iterations += 1
-                        print("✅ Learning loop completed")
-                        
-                        phase = learning_result.get('phase', 'unknown')
-                        iteration = learning_result.get('iteration', 0)
-                        print(f"   Phase: {phase}")
-                        print(f"   Iteration: {iteration}")
-                        
-                        blocked = learning_result.get('blocked_hours', [])
-                        if blocked:
-                            print(f"   Blocked hours: {blocked}")
-                        
-                        if learning_result.get('phase_changed'):
-                            new_phase = learning_result.get('new_phase')
-                            print(f"   🎯 PHASE CHANGE: → {new_phase}")
-                            
-                            if trading_system.notifier and trading_system.notifier.enabled:
-                                trading_system.notifier.send(
-                                    f"🎓 <b>Learning Phase Change!</b>\n\n"
-                                    f"New phase: {new_phase}\n"
-                                    f"Iteration: {iteration}"
-                                )
-                    else:
-                        print(f"   Status: {learning_result.get('status', 'unknown')}")
-                
-                # Also run strategist learning
-                strategist_result = trading_system.strategist.run_learning_loop()
-                
-                if strategist_result.get('status') == 'completed':
-                    if 'promotion' in strategist_result:
-                        promo = strategist_result['promotion']
-                        print(f"🏆 Strategy promoted: {promo.get('new_champion', 'Unknown')}")
-                        
-                        if trading_system.notifier and trading_system.notifier.enabled:
-                            trading_system.notifier.send(
-                                f"🏆 <b>Strategy Promotion!</b>\n\n"
-                                f"New champion: {promo.get('new_champion', 'Unknown')}\n"
-                                f"Reason: {promo.get('reason', 'Outperformed')}"
-                            )
-            except Exception as e:
-                print(f"Learning loop error: {e}")
-                import traceback
-                traceback.print_exc()
+        
+        except Exception as e:
+            print(f"Background task error: {e}")
 
 
+# ============================================================================
+# STARTUP
+# ============================================================================
 def setup_environment():
-    """Setup virtual environment and ngrok tunnel"""
-    import subprocess
-    import sys
+    """Check environment and set up venv if needed"""
+    venv_path = os.path.join(os.getcwd(), 'venv')
+    venv_python = os.path.join(venv_path, 'bin', 'python')
     
-    # Check if running in virtual environment
-    if sys.prefix == sys.base_prefix:
-        print("⚠️  Not running in virtual environment!")
-        print("   Attempting to activate venv...")
-        
-        venv_paths = ['venv', '.venv', 'env']
-        venv_found = False
-        
-        for venv_name in venv_paths:
-            activate_script = os.path.join(venv_name, 'bin', 'activate_this.py')
-            if os.path.exists(activate_script):
-                print(f"   Found {venv_name}, activating...")
-                exec(open(activate_script).read(), {'__file__': activate_script})
-                venv_found = True
-                break
-            
-            # Alternative: check if venv exists and warn user
-            venv_dir = os.path.join(os.getcwd(), venv_name)
-            if os.path.exists(venv_dir):
-                print(f"   ⚠️  Found {venv_name}/ but cannot auto-activate from within Python.")
-                print(f"   Please run: source {venv_name}/bin/activate && python master_v2.py")
-                venv_found = True
-                break
-        
-        if not venv_found:
-            print("   No virtual environment found. Running with system Python.")
-            print("   Consider creating one: python -m venv venv")
+    if os.path.exists(venv_python):
+        if sys.executable != venv_python:
+            print(f"  ⚠️  Running outside venv. Use: source venv/bin/activate")
     else:
-        print(f"✅ Running in virtual environment: {sys.prefix}")
+        print(f"  ⚠️  No venv found at {venv_path}")
 
 
 def start_ngrok(port: int = 5000) -> Optional[str]:
-    """
-    Start ngrok tunnel in a NEW VISIBLE TERMINAL WINDOW.
-    
-    Returns the public URL if successful, None otherwise.
-    """
+    """Start ngrok tunnel in a new terminal"""
     import subprocess
-    import time
-    import requests
     import shutil
     
-    print(f"\n🌐 Starting ngrok tunnel on port {port}...")
-    
-    # Check if ngrok is already running
-    try:
-        response = requests.get('http://127.0.0.1:4040/api/tunnels', timeout=2)
-        if response.status_code == 200:
-            tunnels = response.json().get('tunnels', [])
-            for tunnel in tunnels:
-                if str(port) in tunnel.get('config', {}).get('addr', ''):
-                    public_url = tunnel.get('public_url', '')
-                    print(f"   ✅ ngrok already running: {public_url}")
-                    print(f"   📋 Webhook URL: {public_url}/webhook/helius")
-                    os.environ['WEBHOOK_URL'] = f"{public_url}/webhook/helius"
-                    os.environ['NGROK_URL'] = public_url
-                    return public_url
-    except:
-        pass  # ngrok not running yet
-    
-    # Check if ngrok is installed
     ngrok_path = shutil.which('ngrok')
     if not ngrok_path:
-        print("   ⚠️  ngrok not found! Please install it:")
-        print("      sudo snap install ngrok  (Linux)")
-        print("      brew install ngrok       (macOS)")
-        print("      Or download from: https://ngrok.com/download")
+        print("  ⚠️  ngrok not found in PATH")
         return None
     
-    # Kill any existing ngrok processes
-    subprocess.run(['pkill', '-f', 'ngrok'], capture_output=True)
-    time.sleep(1)
-    
-    # Detect available terminal emulator (Linux)
-    terminal_cmds = [
-        # GNOME Terminal (Ubuntu default)
-        ['gnome-terminal', '--', 'bash', '-c', f'ngrok http {port}; exec bash'],
-        # Konsole (KDE)
-        ['konsole', '-e', 'bash', '-c', f'ngrok http {port}; exec bash'],
-        # XFCE Terminal
-        ['xfce4-terminal', '-e', f'bash -c "ngrok http {port}; exec bash"'],
-        # XTerm (fallback)
-        ['xterm', '-hold', '-e', f'ngrok http {port}'],
-        # macOS Terminal
-        ['osascript', '-e', f'tell app "Terminal" to do script "ngrok http {port}"'],
-    ]
-    
-    terminal_started = False
-    
-    for cmd in terminal_cmds:
-        terminal_name = cmd[0]
-        if shutil.which(terminal_name) or terminal_name == 'osascript':
-            try:
-                print(f"   🖥️  Opening ngrok in {terminal_name}...")
-                subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                terminal_started = True
-                break
-            except Exception as e:
-                continue
-    
-    if not terminal_started:
-        # Fallback: run in background (no visible window)
-        print("   ⚠️  No terminal emulator found, running ngrok in background...")
-        subprocess.Popen(
-            ['ngrok', 'http', str(port)],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
-        )
-    
-    # Wait for ngrok to start and get the URL
-    print("   ⏳ Waiting for ngrok to initialize...")
-    for i in range(15):  # Wait up to 15 seconds
-        time.sleep(1)
-        print(f"   ... {i+1}s", end='\r')
+    try:
+        result = subprocess.run(['pgrep', '-f', f'ngrok.*{port}'], capture_output=True)
+        if result.returncode == 0:
+            print(f"  ℹ️  ngrok already running for port {port}")
+        else:
+            print(f"  🚀 Starting ngrok in new terminal...")
+            
+            terminal_cmd = None
+            if shutil.which('gnome-terminal'):
+                terminal_cmd = ['gnome-terminal', '--', 'ngrok', 'http', str(port)]
+            elif shutil.which('xterm'):
+                terminal_cmd = ['xterm', '-e', f'ngrok http {port}']
+            elif shutil.which('konsole'):
+                terminal_cmd = ['konsole', '-e', 'ngrok', 'http', str(port)]
+            
+            if terminal_cmd:
+                subprocess.Popen(terminal_cmd, start_new_session=True)
+                time.sleep(3)
+            else:
+                print("  ⚠️  No terminal emulator found")
+                return None
+        
+        # Get ngrok URL
+        time.sleep(2)
+        import requests
         try:
-            response = requests.get('http://127.0.0.1:4040/api/tunnels', timeout=2)
-            if response.status_code == 200:
-                tunnels = response.json().get('tunnels', [])
+            resp = requests.get('http://127.0.0.1:4040/api/tunnels', timeout=5)
+            if resp.status_code == 200:
+                tunnels = resp.json().get('tunnels', [])
                 for tunnel in tunnels:
-                    public_url = tunnel.get('public_url', '')
-                    if public_url and 'https' in public_url:
-                        print(f"\n   ✅ ngrok tunnel established!")
-                        print(f"   🔗 Public URL: {public_url}")
-                        print(f"   📋 Webhook URL: {public_url}/webhook/helius")
-                        print(f"   📊 Dashboard: http://127.0.0.1:4040")
-                        
-                        # Update environment variable
-                        os.environ['WEBHOOK_URL'] = f"{public_url}/webhook/helius"
-                        os.environ['NGROK_URL'] = public_url
-                        
-                        return public_url
+                    if tunnel.get('proto') == 'https':
+                        url = tunnel.get('public_url')
+                        print(f"  ✅ ngrok URL: {url}")
+                        return url
         except:
             pass
-    
-    print("\n   ⚠️  ngrok started but couldn't get public URL")
-    print("   Check http://127.0.0.1:4040 for ngrok dashboard")
-    print("   You may need to authenticate: ngrok config add-authtoken YOUR_TOKEN")
-    return None
+        
+        print("  ⚠️  Could not get ngrok URL")
+        return None
+        
+    except Exception as e:
+        print(f"  ⚠️  ngrok error: {e}")
+        return None
 
 
 def main():
     global trading_system
     
-    # ========================================================================
-    # STARTUP: Environment and ngrok setup
-    # ========================================================================
     print("\n" + "="*70)
     print("🔧 ENVIRONMENT SETUP")
     print("="*70)
     
-    # Check/activate virtual environment
     setup_environment()
     
-    # ALWAYS start ngrok in a new terminal window
-    # This ensures we have a fresh, working tunnel
     ngrok_url = start_ngrok(port=CONFIG.webhook_port)
     
     if ngrok_url:
@@ -1570,12 +1331,9 @@ def main():
         print(f"      {webhook_url}")
     else:
         print("\n   ⚠️  ngrok failed to start!")
-        print("   You can still run the system if you have a webhook URL configured.")
         existing_url = os.getenv('WEBHOOK_URL')
         if existing_url:
             print(f"   Using fallback: {existing_url}")
-        else:
-            print("   WARNING: No webhook URL available - webhooks won't work!")
     
     try:
         trading_system = TradingSystem()
@@ -1584,16 +1342,16 @@ def main():
         bg_thread.start()
         print(f"\n🔄 Background tasks running")
         
-        print(f"\n🎧 WEBHOOK SERVER STARTING (LEARNING MODE)")
+        print(f"\n🎧 WEBHOOK SERVER STARTING (ROBUST PLATFORM)")
         print(f"   Webhook:     http://{CONFIG.webhook_host}:{CONFIG.webhook_port}/webhook/helius")
         print(f"   Status:      http://{CONFIG.webhook_host}:{CONFIG.webhook_port}/status")
         print(f"   Diagnostics: http://{CONFIG.webhook_host}:{CONFIG.webhook_port}/diagnostics")
         print(f"   Positions:   http://{CONFIG.webhook_host}:{CONFIG.webhook_port}/positions")
-        print(f"   New Wallets: http://{CONFIG.webhook_host}:{CONFIG.webhook_port}/new_wallets")
+        print(f"   Baseline:    http://{CONFIG.webhook_host}:{CONFIG.webhook_port}/baseline")
+        print(f"   A/B Tests:   http://{CONFIG.webhook_host}:{CONFIG.webhook_port}/ab_test")
+        print(f"   Backtest:    POST http://{CONFIG.webhook_host}:{CONFIG.webhook_port}/backtest")
         print(f"   Discovery:   POST http://{CONFIG.webhook_host}:{CONFIG.webhook_port}/discovery/run")
         print(f"   Learning:    POST http://{CONFIG.webhook_host}:{CONFIG.webhook_port}/learning/run")
-        print(f"   Insights:    GET  http://{CONFIG.webhook_host}:{CONFIG.webhook_port}/learning/insights")
-        print(f"   Diurnal:     GET  http://{CONFIG.webhook_host}:{CONFIG.webhook_port}/learning/diurnal")
         print(f"   Test:        http://{CONFIG.webhook_host}:{CONFIG.webhook_port}/test")
         print(f"\n   Press Ctrl+C to stop\n")
         
