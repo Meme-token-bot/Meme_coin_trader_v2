@@ -1,75 +1,41 @@
 {
-  "timestamp": "2026-01-25T18:27:04.167921",
+  "timestamp": "2026-01-25T19:11:27.303329",
   "stats": {
-    "candidates_found": 11,
+    "candidates_found": 7,
     "from_birdeye": 0,
     "from_new_tokens": 6,
-    "from_reverse": 5,
-    "validated": 11,
-    "profiled": 11,
-    "verified": 7,
+    "from_reverse": 1,
+    "validated": 7,
+    "profiled": 7,
+    "verified": 2,
     "verified_wallets": [
       {
-        "address": "6kKZArpR1WQ9tzZ6LkAQXJyMuRKvq9adLUTtqnGSyc2n",
-        "win_rate": 0.631578947368421,
-        "pnl_sol": 4.684301342808479,
-        "completed_swings": 38,
-        "source": "reverse_discovery"
+        "address": "2AXKCshcLRDU2EFXpWw4FCpDHoqRY5wjbn9mtGDsAbGb",
+        "win_rate": 0.5714285714285714,
+        "pnl_sol": 4.089564177297461,
+        "completed_swings": 14,
+        "source": "new_token"
       },
       {
-        "address": "6QisQNhyDtjFmgvkZ6SuQk68qHdzaZBRKemkssDAdGRu",
-        "win_rate": 0.5428571428571428,
-        "pnl_sol": 2.391918622000001,
+        "address": "9v3xeLZiWPevBN8ydoDdc7W6KRofScFKYsnizD9WZCmp",
+        "win_rate": 0.6,
+        "pnl_sol": 2.211799592000001,
         "completed_swings": 35,
-        "source": "new_token"
-      },
-      {
-        "address": "3K1um2V9UJRJw1QdRwxbCcprZvRyCtt6Kpw1CEXFT8YF",
-        "win_rate": 0.5625,
-        "pnl_sol": 4.270577716902871,
-        "completed_swings": 32,
-        "source": "reverse_discovery"
-      },
-      {
-        "address": "EoFuBFC9d1FGoWAS2eyV2YkLAEZcJ3byt3XxmEdvBQdD",
-        "win_rate": 0.8529411764705882,
-        "pnl_sol": 1.134815097000001,
-        "completed_swings": 34,
-        "source": "new_token"
-      },
-      {
-        "address": "2sp2e7qHED5a4rKSJCE3uvLmuPYvRkKvVqPGSXEFMucd",
-        "win_rate": 0.7272727272727273,
-        "pnl_sol": 12.192227482567233,
-        "completed_swings": 33,
-        "source": "reverse_discovery"
-      },
-      {
-        "address": "ACsqZR5PmRm8tCqVpRVdPxzB5VMxpKyJ5Fw4sFfCzTXx",
-        "win_rate": 0.5625,
-        "pnl_sol": 4.432239956626557,
-        "completed_swings": 32,
-        "source": "reverse_discovery"
-      },
-      {
-        "address": "Fi9rKVNHn5CPWvYBhsTkVp2z5oywDVrMdosXBhJdBFvR",
-        "win_rate": 0.55,
-        "pnl_sol": 5.768063765329217,
-        "completed_swings": 40,
         "source": "reverse_discovery"
       }
     ],
-    "api_credits_used": 308
+    "api_credits_used": 276,
+    "from_high_volume": 0
   },
   "budget": {
     "total": 1000,
-    "used": 308,
+    "used": 276,
     "breakdown": {
       "reverse_signatures": 20,
       "reverse_parse": 200,
-      "validate_signatures": 11,
-      "validate_parse": 22,
-      "profile_get_swaps": 55
+      "validate_signatures": 7,
+      "validate_parse": 14,
+      "profile_get_swaps": 35
     }
   },
   "config": {

@@ -110,7 +110,7 @@ class LearningConfig:
     # Entry thresholds (EVOLVE OVER TIME)
     min_conviction_score: int = 30          # Start very low
     min_wallet_win_rate: float = 0.40       # Start very low
-    min_liquidity_usd: float = 0  # DISABLED for learning - we want to LEARN if liquidity matters        # Start low
+    min_liquidity_usd: float = 20000        # Start low
     
     # Time restrictions (learned over time)
     blocked_hours_utc: List[int] = field(default_factory=list)  # Hours to avoid
@@ -493,10 +493,9 @@ class LearningPaperTrader:
             if wallet_wr < self.config.min_wallet_win_rate:
                 return False, f"Wallet WR {wallet_wr:.1%} < threshold {self.config.min_wallet_win_rate:.1%}"
             
-            # DISABLED IN EXPLORATION: We want to LEARN if liquidity matters
-            # liquidity = signal.get('liquidity', 0)
-            # if liquidity < self.config.min_liquidity_usd:
-            #     return False, f"Liquidity ${liquidity:,.0f} < threshold ${self.config.min_liquidity_usd:,.0f}"
+            liquidity = signal.get('liquidity', 0)
+            if liquidity < self.config.min_liquidity_usd:
+                return False, f"Liquidity ${liquidity:,.0f} < threshold ${self.config.min_liquidity_usd:,.0f}"
         
         return True, "OK"
     
@@ -562,7 +561,7 @@ class LearningPaperTrader:
         context = EntryContext(
             wallet_address=wallet_data.get('address', '') if wallet_data else '',
             wallet_cluster=wallet_data.get('cluster', 'UNKNOWN') if wallet_data else 'UNKNOWN',
-            wallet_win_rate=(wallet_data.get('win_rate', 0) / 100.0 if wallet_data.get('win_rate', 0) > 1 else wallet_data.get('win_rate', 0)) if wallet_data else 0,  # Normalize wallet WR
+            wallet_win_rate=wallet_data.get('win_rate', 0) if wallet_data else 0,
             wallet_roi_7d=wallet_data.get('roi_7d', 0) if wallet_data else 0,
             wallet_trades_count=wallet_data.get('trades_count', 0) if wallet_data else 0,
             

@@ -388,6 +388,7 @@ class LearningPaperTradingEngine:
     - Comprehensive time tracking
     - Automatic learning every 6 hours
     - Progressive threshold tightening
+    - NO LIQUIDITY FILTER in learning mode
     """
     
     def __init__(self, db, starting_balance: float = 10.0, max_positions: int = None):
@@ -405,6 +406,16 @@ class LearningPaperTradingEngine:
             config=config
         )
         
+        # CRITICAL: Disable liquidity threshold for learning mode
+        # The whole point is to LEARN what works, not filter prematurely
+        if hasattr(self._trader, 'config'):
+            if hasattr(self._trader.config, 'min_liquidity_usd'):
+                self._trader.config.min_liquidity_usd = 0
+            if hasattr(self._trader.config, 'min_conviction_score'):
+                self._trader.config.min_conviction_score = 0
+            if hasattr(self._trader.config, 'min_wallet_win_rate'):
+                self._trader.config.min_wallet_win_rate = 0
+        
         self._last_learning = datetime.utcnow() - timedelta(hours=5)
         
         print(f"🎓 Learning Paper Trading Engine initialized")
@@ -412,6 +423,7 @@ class LearningPaperTradingEngine:
         print(f"   Balance: {self._trader.balance:.4f} SOL")
         print(f"   Positions: {self._trader.open_position_count}")
         print(f"   Mode: LEARNING (unlimited positions)")
+        print(f"   Min Liquidity: ${self._trader.config.min_liquidity_usd:,.0f} (DISABLED)")
     
     @property
     def balance(self) -> float:
@@ -808,7 +820,7 @@ class TradingSystem:
             'token_address': token_addr,
             'token_symbol': token_info.get('symbol', 'UNKNOWN'),
             'price': price,
-            'liquidity': token_info.get('liquidity_usd', 0),
+            'liquidity': token_info.get('liquidity', 0),  # Fixed: was 'liquidity_usd'
             'volume_24h': token_info.get('volume_24h', 0),
             'market_cap': token_info.get('market_cap', 0),
             'token_age_hours': token_info.get('age_hours', 0),
@@ -824,24 +836,25 @@ class TradingSystem:
         if self.paper_engine and hasattr(self.paper_engine, '_trader'):
             # We're in learning mode - use relaxed criteria
             wallet_wr = wallet_data.get('win_rate', 0.5)
+            # Normalize win rate (might be stored as 0.65 or 65)
+            if wallet_wr > 1:
+                wallet_wr = wallet_wr / 100.0
             
             # Handle multiple possible liquidity field names from DexScreener
-            liquidity = (
-                token_info.get('liquidity_usd') or 
-                token_info.get('liquidity', {}).get('usd', 0) if isinstance(token_info.get('liquidity'), dict) else
-                token_info.get('liquidity') or
-                0
-            )
+            liquidity = token_info.get('liquidity', 0)
             if isinstance(liquidity, dict):
                 liquidity = liquidity.get('usd', 0)
             liquidity = float(liquidity or 0)
+            
+            # Update signal_data with correct liquidity for open_position
+            signal_data['liquidity'] = liquidity
+            signal_data['wallet_win_rate'] = wallet_wr
             
             # DEBUG: Print what we got from token_info
             print(f"  📊 Token Info: ${signal_data['token_symbol']}")
             print(f"     Price: ${price:.8f}")
             print(f"     Liquidity: ${liquidity:,.0f}")
             print(f"     Wallet WR: {wallet_wr:.0%}")
-            print(f"     Raw liquidity field: {token_info.get('liquidity')}")
             
             # LEARNING MODE FILTERS (EXTREMELY permissive):
             # - Just need a valid price
