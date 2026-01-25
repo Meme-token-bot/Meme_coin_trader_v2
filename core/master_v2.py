@@ -824,17 +824,33 @@ class TradingSystem:
         if self.paper_engine and hasattr(self.paper_engine, '_trader'):
             # We're in learning mode - use relaxed criteria
             wallet_wr = wallet_data.get('win_rate', 0.5)
-            liquidity = token_info.get('liquidity_usd', 0)
             
-            # LEARNING MODE FILTERS (very permissive):
-            # - Any liquidity > $5k (was $30k)
-            # - Wallet win rate > 40% (was implied 50%+)
-            # - Token has a price
+            # Handle multiple possible liquidity field names from DexScreener
+            liquidity = (
+                token_info.get('liquidity_usd') or 
+                token_info.get('liquidity', {}).get('usd', 0) if isinstance(token_info.get('liquidity'), dict) else
+                token_info.get('liquidity') or
+                0
+            )
+            if isinstance(liquidity, dict):
+                liquidity = liquidity.get('usd', 0)
+            liquidity = float(liquidity or 0)
+            
+            # DEBUG: Print what we got from token_info
+            print(f"  📊 Token Info: ${signal_data['token_symbol']}")
+            print(f"     Price: ${price:.8f}")
+            print(f"     Liquidity: ${liquidity:,.0f}")
+            print(f"     Wallet WR: {wallet_wr:.0%}")
+            print(f"     Raw liquidity field: {token_info.get('liquidity')}")
+            
+            # LEARNING MODE FILTERS (EXTREMELY permissive):
+            # - Just need a valid price
+            # - Wallet win rate >= 30% (very low bar)
+            # - NO liquidity filter - we want to LEARN if liquidity matters
             
             should_enter_learning = (
-                liquidity >= 5000 and  # Relaxed from $30k
-                wallet_wr >= 0.40 and  # Relaxed threshold
-                price > 0
+                price > 0 and
+                wallet_wr >= 0.30  # Very relaxed threshold
             )
             
             if should_enter_learning:
@@ -875,9 +891,9 @@ class TradingSystem:
                     print(f"     ⚠️ Position open failed")
             else:
                 skip_reason = []
-                if liquidity < 5000:
-                    skip_reason.append(f'Low liq: ${liquidity:,.0f}')
-                if wallet_wr < 0.40:
+                if price <= 0:
+                    skip_reason.append(f'No price')
+                if wallet_wr < 0.30:
                     skip_reason.append(f'Low WR: {wallet_wr:.0%}')
                 print(f"  ⏭️ LEARNING SKIP: {', '.join(skip_reason)}")
                 result['reason'] = f"Learning filter: {', '.join(skip_reason)}"
