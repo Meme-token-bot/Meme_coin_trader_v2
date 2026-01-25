@@ -1286,13 +1286,14 @@ def setup_environment():
 
 def start_ngrok(port: int = 5000) -> Optional[str]:
     """
-    Start ngrok tunnel to expose webhook endpoint.
+    Start ngrok tunnel in a NEW VISIBLE TERMINAL WINDOW.
     
     Returns the public URL if successful, None otherwise.
     """
     import subprocess
     import time
     import requests
+    import shutil
     
     print(f"\n🌐 Starting ngrok tunnel on port {port}...")
     
@@ -1305,59 +1306,91 @@ def start_ngrok(port: int = 5000) -> Optional[str]:
                 if str(port) in tunnel.get('config', {}).get('addr', ''):
                     public_url = tunnel.get('public_url', '')
                     print(f"   ✅ ngrok already running: {public_url}")
+                    print(f"   📋 Webhook URL: {public_url}/webhook/helius")
+                    os.environ['WEBHOOK_URL'] = f"{public_url}/webhook/helius"
+                    os.environ['NGROK_URL'] = public_url
                     return public_url
     except:
         pass  # ngrok not running yet
     
-    # Start ngrok
-    try:
-        # Kill any existing ngrok processes first
-        subprocess.run(['pkill', '-f', 'ngrok'], capture_output=True)
-        time.sleep(1)
-        
-        # Start ngrok in background
-        ngrok_process = subprocess.Popen(
-            ['ngrok', 'http', str(port), '--log=stdout'],
+    # Check if ngrok is installed
+    ngrok_path = shutil.which('ngrok')
+    if not ngrok_path:
+        print("   ⚠️  ngrok not found! Please install it:")
+        print("      sudo snap install ngrok  (Linux)")
+        print("      brew install ngrok       (macOS)")
+        print("      Or download from: https://ngrok.com/download")
+        return None
+    
+    # Kill any existing ngrok processes
+    subprocess.run(['pkill', '-f', 'ngrok'], capture_output=True)
+    time.sleep(1)
+    
+    # Detect available terminal emulator (Linux)
+    terminal_cmds = [
+        # GNOME Terminal (Ubuntu default)
+        ['gnome-terminal', '--', 'bash', '-c', f'ngrok http {port}; exec bash'],
+        # Konsole (KDE)
+        ['konsole', '-e', 'bash', '-c', f'ngrok http {port}; exec bash'],
+        # XFCE Terminal
+        ['xfce4-terminal', '-e', f'bash -c "ngrok http {port}; exec bash"'],
+        # XTerm (fallback)
+        ['xterm', '-hold', '-e', f'ngrok http {port}'],
+        # macOS Terminal
+        ['osascript', '-e', f'tell app "Terminal" to do script "ngrok http {port}"'],
+    ]
+    
+    terminal_started = False
+    
+    for cmd in terminal_cmds:
+        terminal_name = cmd[0]
+        if shutil.which(terminal_name) or terminal_name == 'osascript':
+            try:
+                print(f"   🖥️  Opening ngrok in {terminal_name}...")
+                subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                terminal_started = True
+                break
+            except Exception as e:
+                continue
+    
+    if not terminal_started:
+        # Fallback: run in background (no visible window)
+        print("   ⚠️  No terminal emulator found, running ngrok in background...")
+        subprocess.Popen(
+            ['ngrok', 'http', str(port)],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL
         )
-        
-        # Wait for ngrok to start and get the URL
-        print("   Waiting for ngrok to initialize...")
-        for i in range(10):
-            time.sleep(1)
-            try:
-                response = requests.get('http://127.0.0.1:4040/api/tunnels', timeout=2)
-                if response.status_code == 200:
-                    tunnels = response.json().get('tunnels', [])
-                    for tunnel in tunnels:
-                        public_url = tunnel.get('public_url', '')
-                        if public_url and 'https' in public_url:
-                            print(f"   ✅ ngrok tunnel established!")
-                            print(f"   🔗 Public URL: {public_url}")
-                            print(f"   📋 Webhook URL: {public_url}/webhook/helius")
-                            
-                            # Update environment variable
-                            os.environ['WEBHOOK_URL'] = f"{public_url}/webhook/helius"
-                            os.environ['NGROK_URL'] = public_url
-                            
-                            return public_url
-            except:
-                pass
-        
-        print("   ⚠️  ngrok started but couldn't get public URL")
-        print("   Check http://127.0.0.1:4040 for ngrok dashboard")
-        return None
-        
-    except FileNotFoundError:
-        print("   ⚠️  ngrok not found! Please install it:")
-        print("      brew install ngrok  (macOS)")
-        print("      snap install ngrok  (Linux)")
-        print("      Or download from: https://ngrok.com/download")
-        return None
-    except Exception as e:
-        print(f"   ⚠️  Error starting ngrok: {e}")
-        return None
+    
+    # Wait for ngrok to start and get the URL
+    print("   ⏳ Waiting for ngrok to initialize...")
+    for i in range(15):  # Wait up to 15 seconds
+        time.sleep(1)
+        print(f"   ... {i+1}s", end='\r')
+        try:
+            response = requests.get('http://127.0.0.1:4040/api/tunnels', timeout=2)
+            if response.status_code == 200:
+                tunnels = response.json().get('tunnels', [])
+                for tunnel in tunnels:
+                    public_url = tunnel.get('public_url', '')
+                    if public_url and 'https' in public_url:
+                        print(f"\n   ✅ ngrok tunnel established!")
+                        print(f"   🔗 Public URL: {public_url}")
+                        print(f"   📋 Webhook URL: {public_url}/webhook/helius")
+                        print(f"   📊 Dashboard: http://127.0.0.1:4040")
+                        
+                        # Update environment variable
+                        os.environ['WEBHOOK_URL'] = f"{public_url}/webhook/helius"
+                        os.environ['NGROK_URL'] = public_url
+                        
+                        return public_url
+        except:
+            pass
+    
+    print("\n   ⚠️  ngrok started but couldn't get public URL")
+    print("   Check http://127.0.0.1:4040 for ngrok dashboard")
+    print("   You may need to authenticate: ngrok config add-authtoken YOUR_TOKEN")
+    return None
 
 
 def main():
@@ -1373,13 +1406,22 @@ def main():
     # Check/activate virtual environment
     setup_environment()
     
-    # Start ngrok tunnel (optional - skip if WEBHOOK_URL already set)
-    if not os.getenv('WEBHOOK_URL'):
-        ngrok_url = start_ngrok(port=CONFIG.webhook_port)
-        if ngrok_url:
-            print(f"\n   💡 Update your Helius webhook to: {ngrok_url}/webhook/helius")
+    # ALWAYS start ngrok in a new terminal window
+    # This ensures we have a fresh, working tunnel
+    ngrok_url = start_ngrok(port=CONFIG.webhook_port)
+    
+    if ngrok_url:
+        webhook_url = f"{ngrok_url}/webhook/helius"
+        print(f"\n   💡 TIP: If your Helius webhook URL is different, update it to:")
+        print(f"      {webhook_url}")
     else:
-        print(f"\n✅ Using existing WEBHOOK_URL: {os.getenv('WEBHOOK_URL')}")
+        print("\n   ⚠️  ngrok failed to start!")
+        print("   You can still run the system if you have a webhook URL configured.")
+        existing_url = os.getenv('WEBHOOK_URL')
+        if existing_url:
+            print(f"   Using fallback: {existing_url}")
+        else:
+            print("   WARNING: No webhook URL available - webhooks won't work!")
     
     try:
         trading_system = TradingSystem()
