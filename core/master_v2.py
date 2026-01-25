@@ -1,9 +1,13 @@
 """
-MASTER V2 - Webhook-Based Trading System with Automated Discovery
-Trading System V2 - Uses Helius webhooks + smart discovery + auto webhook management
+MASTER V2 - Webhook-Based Trading System with Learning Paper Trader
+Trading System V2 - Uses Helius webhooks + smart discovery + LEARNING MODE
 
-UPDATED: Now properly passes budget parameters to discovery
-         and uses discovery_config for intervals
+UPDATED: Integrated Learning Paper Trader with:
+1. Unlimited position opening for data collection
+2. Comprehensive time-of-day tracking for diurnal analysis
+3. Fixed hold time in Telegram notifications
+4. Automatic learning loop every 6 hours
+5. Progressive strategy refinement
 
 COMPLETE VERSION - Ready to run
 """
@@ -24,11 +28,20 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from core.database_v2 import DatabaseV2
-from core.discovery_integration import HistorianV8 as Historian  # v8 discovery
+from core.discovery_integration import HistorianV8 as Historian
 from core.strategist_v2 import Strategist
 from core.discovery_config import config as discovery_config
 from infrastructure.helius_webhook_manager import HeliusWebhookManager
-from core.paper_engine_replacement import PaperTradingEngine
+
+# ============================================================================
+# CHANGE 1: Import Learning Paper Trader components
+# ============================================================================
+from core.learning_paper_trader import (
+    LearningPaperTrader, 
+    LearningConfig, 
+    ExitReason
+)
+
 
 @dataclass
 class MasterConfig:
@@ -37,14 +50,12 @@ class MasterConfig:
     webhook_port: int = 5000
     position_check_interval: int = 300
     discovery_enabled: bool = True
-    # UPDATED: Use discovery_config values instead of hardcoded
-    # discovery_interval_hours is now read from discovery_config
     max_token_lookups_per_minute: int = 20
     max_api_calls_per_hour: int = 500
     paper_trading_enabled: bool = True
     paper_starting_balance: float = 10.0
     use_llm: bool = True
-    max_open_positions: int = 5
+    max_open_positions: int = 999  # CHANGED: Unlimited for learning mode
     max_position_size_sol: float = 1.0
     
     @property
@@ -56,6 +67,7 @@ class MasterConfig:
     def discovery_api_budget(self) -> int:
         """Get discovery API budget from discovery_config"""
         return discovery_config.max_api_calls_per_discovery
+
 
 CONFIG = MasterConfig()
 
@@ -111,6 +123,7 @@ class DiagnosticsTracker:
     llm_calls: int = 0
     discoveries_run: int = 0
     wallets_discovered: int = 0
+    learning_iterations: int = 0  # NEW: Track learning iterations
     recent_events: deque = field(default_factory=lambda: deque(maxlen=50))
     
     def log_event(self, event_type: str, details: str = ""):
@@ -134,12 +147,18 @@ class DiagnosticsTracker:
             'api': {'calls': self.api_calls_made, 'errors': self.api_errors},
             'positions': {'opened': self.positions_opened, 'closed': self.positions_closed},
             'discovery': {'runs': self.discoveries_run, 'wallets_found': self.wallets_discovered},
+            'learning_iterations': self.learning_iterations,
             'llm_calls': self.llm_calls,
             'recent_events': list(self.recent_events)[-10:]
         }
 
 
+# ============================================================================
+# CHANGE 2: Fixed Notifier with accurate hold time
+# ============================================================================
 class Notifier:
+    """Telegram notifier with FIXED hold time display"""
+    
     def __init__(self, token: str = None, chat_id: str = None):
         self.token = token or os.getenv('TELEGRAM_BOT_TOKEN')
         self.chat_id = chat_id or os.getenv('TELEGRAM_CHAT_ID')
@@ -157,6 +176,9 @@ class Notifier:
             print(f"  ⚠️ Telegram error: {e}")
     
     def send_entry_alert(self, signal: Dict, decision: Dict):
+        """Send entry notification with learning context"""
+        current_hour = datetime.utcnow().hour
+        
         msg = f"""🎯 <b>ENTRY SIGNAL</b>
 
 Token: ${signal.get('token_symbol', 'UNKNOWN')}
@@ -166,19 +188,84 @@ Regime: {decision.get('regime', 'UNKNOWN')}
 Position: {decision.get('position_size_sol', 0):.3f} SOL
 Stop: {decision.get('stop_loss', 0)*100:.0f}%
 Target: {decision.get('take_profit', 0)*100:.0f}%
-LLM: {'✅' if decision.get('llm_called') else '❌'}"""
+LLM: {'✅' if decision.get('llm_called') else '❌'}
+Hour (UTC): {current_hour:02d}:00"""
         self.send(msg)
     
-    def send_exit_alert(self, position: Dict, reason: str, pnl_pct: float):
+    def send_exit_alert(self, position: Dict, reason: str, pnl_pct: float, result: Dict = None):
+        """
+        Send exit notification with FIXED hold time.
+        
+        CHANGE 4: Now accepts result dict for accurate hold time
+        """
         emoji = "🟢" if pnl_pct > 0 else "🔴"
-        hold_mins = position.get('hold_duration_minutes') or 0
+        
+        # FIX: Get hold time from multiple sources
+        hold_mins = self._get_hold_time(position, result)
+        
+        # Format hold time nicely
+        if hold_mins >= 60:
+            hold_str = f"{hold_mins/60:.1f}h ({hold_mins:.0f}m)"
+        else:
+            hold_str = f"{hold_mins:.0f} min"
+        
+        # Get PnL in SOL
+        pnl_sol = 0
+        if result:
+            pnl_sol = result.get('pnl_sol', 0)
+        
+        # Get entry/exit hours for diurnal tracking display
+        entry_hour = position.get('entry_hour_utc', 'N/A')
+        exit_hour = datetime.utcnow().hour
+        
         msg = f"""{emoji} <b>EXIT</b>
 
 Token: ${position.get('token_symbol', 'UNKNOWN')}
 Reason: {reason}
-P&L: {pnl_pct:+.1f}%
-Hold: {hold_mins:.0f} min"""
+P&L: {pnl_pct:+.1f}% ({pnl_sol:+.4f} SOL)
+Hold: {hold_str}
+Entry Hour: {entry_hour}:00 UTC
+Exit Hour: {exit_hour:02d}:00 UTC"""
         self.send(msg)
+    
+    def _get_hold_time(self, position: Dict, result: Dict = None) -> float:
+        """
+        Get hold time from multiple possible sources.
+        This is THE FIX for the "Hold: 0 minutes" bug.
+        """
+        # Priority 1: From result dict (most accurate)
+        if result:
+            if result.get('hold_minutes'):
+                return result['hold_minutes']
+            if result.get('hold_duration_minutes'):
+                return result['hold_duration_minutes']
+        
+        # Priority 2: From position dict (check multiple field names)
+        if position.get('hold_duration_minutes'):
+            return position['hold_duration_minutes']
+        if position.get('hold_minutes'):
+            return position['hold_minutes']
+        
+        # Priority 3: Calculate from timestamps
+        entry_time = position.get('entry_time')
+        exit_time = position.get('exit_time') or datetime.utcnow()
+        
+        if entry_time:
+            if isinstance(entry_time, str):
+                try:
+                    entry_time = datetime.fromisoformat(entry_time.replace('Z', ''))
+                except:
+                    return 0
+            
+            if isinstance(exit_time, str):
+                try:
+                    exit_time = datetime.fromisoformat(exit_time.replace('Z', ''))
+                except:
+                    exit_time = datetime.utcnow()
+            
+            return (exit_time - entry_time).total_seconds() / 60
+        
+        return 0
     
     def send_discovery_alert(self, wallet: str, performance: Dict):
         msg = f"""🎯 <b>NEW WALLET DISCOVERED</b>
@@ -201,23 +288,289 @@ Avg Hold: {performance.get('avg_hold_hours', 0):.1f}h
         diag = diagnostics.to_dict()
         last_webhook = f"{diag['minutes_since_last_webhook']:.0f}m ago" if diag['minutes_since_last_webhook'] else "Never"
         
+        # Include learning info
+        phase = paper_stats.get('phase', 'N/A')
+        iteration = paper_stats.get('iteration', 0)
+        blocked_hours = paper_stats.get('blocked_hours', [])
+        
         msg = f"""📊 <b>Hourly Status</b>
 
 Uptime: {diag['uptime_hours']:.1f}h
 Webhooks: {diag['webhooks']['received']} received
 Last webhook: {last_webhook}
-Paper: {paper_stats['balance']:.2f} SOL ({paper_stats['return_pct']:+.1f}%)
-Open positions: {paper_stats['open_positions']}
-API calls: {diag['api']['calls']} | Errors: {diag['api']['errors']}
-LLM calls: {diag['llm_calls']}
-Discoveries: {diag['discovery']['runs']} | Wallets found: {diag['discovery']['wallets_found']}"""
+Paper: {paper_stats.get('balance', 0):.2f} SOL ({paper_stats.get('return_pct', 0):+.1f}%)
+Open positions: {paper_stats.get('open_positions', 0)}
+Win rate: {paper_stats.get('win_rate', 0):.0%}
+
+🎓 Learning:
+Phase: {phase}
+Iteration: {iteration}
+Blocked hours: {blocked_hours if blocked_hours else 'None'}"""
         self.send(msg)
+    
+    def send_learning_alert(self, results: Dict):
+        """Send learning iteration results"""
+        perf = results.get('performance', {})
+        
+        msg = f"""🎓 <b>LEARNING ITERATION #{results.get('iteration', 0)}</b>
+
+📊 Performance:
+• Trades: {perf.get('total_trades', 0)}
+• Win Rate: {perf.get('win_rate', 0):.1%}
+• Total PnL: {perf.get('total_pnl', 0):+.4f} SOL
+
+📈 Current Phase: {results.get('phase', 'unknown')}
+"""
+        
+        if results.get('phase_changed'):
+            msg += f"\n🎯 <b>PHASE CHANGE: {results.get('new_phase')}</b>\n"
+        
+        blocked = results.get('blocked_hours', [])
+        preferred = results.get('preferred_hours', [])
+        
+        if blocked:
+            msg += f"\n🚫 Blocked Hours: {blocked}"
+        if preferred:
+            msg += f"\n⭐ Preferred Hours: {preferred}"
+        
+        recs = results.get('recommendations', [])[:3]
+        if recs:
+            msg += "\n\n💡 Recommendations:"
+            for rec in recs:
+                msg += f"\n• {rec[:80]}"
+        
+        self.send(msg)
+
+
+# ============================================================================
+# CHANGE 3: Learning Paper Trading Engine (drop-in replacement)
+# ============================================================================
+class LearningPaperTradingEngine:
+    """
+    Drop-in replacement for PaperTradingEngine with learning capabilities.
+    
+    Key differences:
+    - No position limits (collects maximum data)
+    - Comprehensive time tracking
+    - Automatic learning every 6 hours
+    - Progressive threshold tightening
+    """
+    
+    def __init__(self, db, starting_balance: float = 10.0, max_positions: int = None):
+        self.db = db
+        
+        config = LearningConfig(
+            starting_balance_sol=starting_balance,
+            max_open_positions=999,  # No limit for learning
+            enable_auto_exits=True,
+            learning_interval_hours=6.0
+        )
+        
+        self._trader = LearningPaperTrader(
+            db_path="learning_paper_trades.db",
+            config=config
+        )
+        
+        self._last_learning = datetime.utcnow() - timedelta(hours=5)
+        
+        print(f"🎓 Learning Paper Trading Engine initialized")
+        print(f"   Phase: {self._trader.config.current_phase}")
+        print(f"   Balance: {self._trader.balance:.4f} SOL")
+        print(f"   Positions: {self._trader.open_position_count}")
+        print(f"   Mode: LEARNING (unlimited positions)")
+    
+    @property
+    def balance(self) -> float:
+        return self._trader.balance
+    
+    @property
+    def available_balance(self) -> float:
+        return self._trader.balance - self._trader.reserved_balance
+    
+    def open_position(self, signal: Dict, decision: Dict, price: float) -> Optional[int]:
+        """Open a paper position with learning tracking"""
+        signal_data = {
+            'token_address': signal.get('token_address', ''),
+            'token_symbol': signal.get('token_symbol', 'UNKNOWN'),
+            'liquidity': signal.get('liquidity', 0),
+            'volume_24h': signal.get('volume_24h', 0),
+            'market_cap': signal.get('market_cap', 0),
+            'token_age_hours': signal.get('token_age_hours', 0),
+            'holder_count': signal.get('holder_count', 0),
+            'conviction_score': decision.get('conviction_score', 50),
+            'wallet_win_rate': signal.get('wallet_win_rate', 0.5)
+        }
+        
+        wallet_data = {
+            'address': signal.get('wallet', signal.get('wallet_address', '')),
+            'win_rate': signal.get('wallet_win_rate', 0.5),
+            'cluster': signal.get('wallet_cluster', 'UNKNOWN'),
+            'roi_7d': signal.get('wallet_roi', 0),
+            'trades_count': signal.get('wallet_trades', 0)
+        }
+        
+        stop_loss = decision.get('stop_loss', -0.15)
+        if stop_loss > 0:
+            stop_loss = -stop_loss
+        stop_loss_pct = stop_loss * 100
+        
+        take_profit = decision.get('take_profit', 0.30)
+        take_profit_pct = take_profit * 100
+        
+        return self._trader.open_position(
+            token_address=signal.get('token_address', ''),
+            token_symbol=signal.get('token_symbol', 'UNKNOWN'),
+            entry_price=price,
+            signal=signal_data,
+            wallet_data=wallet_data,
+            decision=decision,
+            size_sol=decision.get('position_size_sol'),
+            stop_loss=stop_loss_pct,
+            take_profit=take_profit_pct
+        )
+    
+    def check_exit_conditions(self, position: Dict, current_price: float) -> Optional[str]:
+        """Check if position should exit (handled by background monitor)"""
+        entry_price = position.get('entry_price', 0)
+        if entry_price <= 0 or current_price <= 0:
+            return None
+        
+        pnl_pct = ((current_price / entry_price) - 1) * 100
+        
+        if pnl_pct <= position.get('stop_loss_pct', -15):
+            return 'STOP_LOSS'
+        if pnl_pct >= position.get('take_profit_pct', 30):
+            return 'TAKE_PROFIT'
+        
+        peak_price = position.get('peak_price', entry_price)
+        trailing_stop = position.get('trailing_stop_pct', 10)
+        
+        if peak_price > entry_price:
+            peak_pnl_pct = ((peak_price / entry_price) - 1) * 100
+            if peak_pnl_pct >= 15:
+                from_peak_pct = ((current_price / peak_price) - 1) * 100
+                if from_peak_pct <= -trailing_stop:
+                    return 'TRAILING_STOP'
+        
+        entry_time = position.get('entry_time')
+        max_hold = position.get('max_hold_hours', 12)
+        
+        if entry_time:
+            if isinstance(entry_time, str):
+                entry_time = datetime.fromisoformat(entry_time.replace('Z', ''))
+            hold_hours = (datetime.utcnow() - entry_time).total_seconds() / 3600
+            if hold_hours >= max_hold:
+                return 'TIME_STOP'
+        
+        return None
+    
+    def close_position(self, position_id: int, exit_reason: str, exit_price: float) -> Optional[Dict]:
+        """Close a paper position with accurate hold time tracking"""
+        reason_map = {
+            'STOP_LOSS': ExitReason.STOP_LOSS,
+            'TAKE_PROFIT': ExitReason.TAKE_PROFIT,
+            'TRAILING_STOP': ExitReason.TRAILING_STOP,
+            'TIME_STOP': ExitReason.TIME_STOP,
+            'SMART_EXIT': ExitReason.SMART_EXIT,
+            'MANUAL': ExitReason.MANUAL,
+        }
+        
+        # Handle exit reasons that might have extra text
+        clean_reason = exit_reason.split(':')[0] if ':' in exit_reason else exit_reason
+        reason_enum = reason_map.get(clean_reason, ExitReason.MANUAL)
+        
+        result = self._trader.close_position(
+            position_id=position_id,
+            exit_price=exit_price,
+            exit_reason=reason_enum
+        )
+        
+        if result:
+            return {
+                'pnl_pct': result['pnl_pct'],
+                'pnl_sol': result['pnl_sol'],
+                'hold_minutes': result['hold_minutes'],
+                'hold_duration_minutes': result['hold_minutes'],
+                'entry_hour_utc': result.get('entry_hour_utc'),
+                'exit_hour_utc': result.get('exit_hour_utc'),
+                'is_win': result['is_win']
+            }
+        return None
+    
+    def get_open_positions(self) -> List[Dict]:
+        return self._trader.get_open_positions()
+    
+    def get_stats(self) -> Dict:
+        """Get trading statistics including learning info"""
+        summary = self._trader.get_performance_summary()
+        return {
+            'balance': summary.get('balance', 0),
+            'starting_balance': summary.get('starting_balance', 0),
+            'total_pnl': summary.get('total_pnl_sol', 0),
+            'return_pct': summary.get('return_pct', 0),
+            'open_positions': summary.get('open_positions', 0),
+            'total_trades': summary.get('total_trades', 0),
+            'win_rate': summary.get('win_rate', 0),
+            'profit_factor': 0,
+            'phase': summary.get('phase', 'exploration'),
+            'iteration': summary.get('iteration', 0),
+            'blocked_hours': summary.get('blocked_hours', []),
+            'preferred_hours': summary.get('preferred_hours', []),
+            'min_conviction': summary.get('min_conviction', 30),
+            'min_wallet_wr': summary.get('min_wallet_wr', 0.40)
+        }
+    
+    def should_run_learning(self) -> bool:
+        """Check if it's time to run learning"""
+        hours_since = (datetime.utcnow() - self._last_learning).total_seconds() / 3600
+        return hours_since >= self._trader.config.learning_interval_hours
+    
+    def run_learning(self, force: bool = False, notifier=None) -> Dict:
+        """Run learning iteration"""
+        if not force and not self.should_run_learning():
+            return {'status': 'skipped', 'reason': 'not time yet'}
+        
+        self._last_learning = datetime.utcnow()
+        results = self._trader.run_learning_iteration(force=True)
+        
+        if notifier and hasattr(notifier, 'send_learning_alert'):
+            try:
+                notifier.send_learning_alert(results)
+            except Exception as e:
+                print(f"  ⚠️ Learning notification error: {e}")
+        
+        return results
+    
+    def get_diurnal_report(self) -> Dict:
+        """Get time-of-day performance report"""
+        return self._trader.get_diurnal_report()
+    
+    def get_strategy_feedback(self) -> Dict:
+        """Get detailed feedback for strategy improvement"""
+        return {
+            'summary': self._trader.get_performance_summary(),
+            'diurnal': self._trader.get_diurnal_report(),
+            'config': {
+                'phase': self._trader.config.current_phase,
+                'iteration': self._trader.config.iteration_count,
+                'min_conviction': self._trader.config.min_conviction_score,
+                'min_wallet_wr': self._trader.config.min_wallet_win_rate,
+                'blocked_hours': self._trader.config.blocked_hours_utc,
+                'preferred_hours': self._trader.config.preferred_hours_utc
+            }
+        }
+    
+    def print_status(self):
+        self._trader.print_status()
+    
+    def stop(self):
+        self._trader.stop_monitor()
 
 
 class TradingSystem:
     def __init__(self):
         print("\n" + "="*70)
-        print("🚀 TRADING SYSTEM V2 (WEBHOOK + AUTO-DISCOVERY)")
+        print("🚀 TRADING SYSTEM V2 (LEARNING MODE)")
         print("="*70)
         
         self.helius_key = os.getenv('HELIUS_KEY')
@@ -236,13 +589,16 @@ class TradingSystem:
         self.notifier = Notifier()
         print(f"  {'✅' if self.notifier.enabled else '⚠️'} Telegram: {'enabled' if self.notifier.enabled else 'disabled'}")
         
+        # ====================================================================
+        # CHANGE 3: Use Learning Paper Trading Engine
+        # ====================================================================
         if CONFIG.paper_trading_enabled:
-            self.paper_engine = PaperTradingEngine(
+            self.paper_engine = LearningPaperTradingEngine(
                 self.db, 
                 starting_balance=CONFIG.paper_starting_balance,
                 max_positions=CONFIG.max_open_positions
-                )
-            print(f"  ✅ Paper Trading (Balance: {self.paper_engine.balance:.2f} SOL)")
+            )
+            print(f"  ✅ Learning Paper Trading (Balance: {self.paper_engine.balance:.2f} SOL)")
         else:
             self.paper_engine = None
         
@@ -252,7 +608,6 @@ class TradingSystem:
         self.diagnostics = DiagnosticsTracker()
         print("  ✅ Diagnostics Tracker")
         
-        # Initialize multi-webhook manager (scales past 25 wallets)
         webhook_url = os.getenv('WEBHOOK_URL', f'http://0.0.0.0:{CONFIG.webhook_port}/webhook/helius')
 
         try:
@@ -276,8 +631,10 @@ class TradingSystem:
             self.historian = None
             print("  ⚠️ Discovery disabled")
         
+        self.start_time = datetime.now()
+        
         print("\n" + "="*70)
-        print("✅ TRADING SYSTEM V2 READY")
+        print("✅ TRADING SYSTEM V2 (LEARNING MODE) READY")
         print("="*70)
         self._print_status()
     
@@ -294,11 +651,14 @@ class TradingSystem:
         if self.paper_engine:
             stats = self.paper_engine.get_stats()
             print(f"  Paper: {stats['balance']:.2f} SOL ({stats['return_pct']:+.1f}%) | {stats['open_positions']} open")
+            print(f"  Learning Phase: {stats.get('phase', 'N/A')} | Iteration: {stats.get('iteration', 0)}")
+            blocked = stats.get('blocked_hours', [])
+            if blocked:
+                print(f"  Blocked Hours: {blocked}")
         
         rate_stats = self.rate_limiter.get_stats()
         print(f"  Rate limit: {rate_stats['calls_last_hour']}/{rate_stats['limit_per_hour']} calls/hr")
         
-        # Show discovery config
         print(f"\n📋 Discovery Config:")
         print(f"  Interval: {CONFIG.discovery_interval_hours}h")
         print(f"  Budget: {CONFIG.discovery_api_budget:,} credits")
@@ -379,42 +739,42 @@ class TradingSystem:
         
         token_info = self.historian.scanner.get_token_info(token_addr)
         
-        if not token_info or token_info.get('price_usd', 0) <= 0:
+        if not token_info:
             self.diagnostics.api_errors += 1
             result['reason'] = 'Could not get token info'
             return result
         
         signal_data = {
-            'token_symbol': token_info.get('symbol', 'UNKNOWN'),
             'token_address': token_addr,
+            'token_symbol': token_info.get('symbol', 'UNKNOWN'),
             'price': token_info.get('price_usd', 0),
-            'liquidity': token_info.get('liquidity', 0),
+            'liquidity': token_info.get('liquidity_usd', 0),
             'volume_24h': token_info.get('volume_24h', 0),
+            'market_cap': token_info.get('market_cap', 0),
             'token_age_hours': token_info.get('age_hours', 0),
-            'wallet_count': 1,
-            'avg_wallet_win_rate': wallet_data.get('win_rate', 0.5)
+            'holder_count': token_info.get('holder_count', 0),
+            'wallet': wallet_data['address'],
+            'wallet_win_rate': wallet_data.get('win_rate', 0.5),
+            'wallet_cluster': wallet_data.get('cluster', 'UNKNOWN')
         }
-        
-        print(f"\n  📊 Analyzing ${signal_data['token_symbol']}...")
-        self.diagnostics.log_event('ANALYZING', f"${signal_data['token_symbol']}")
         
         decision = self.strategist.analyze_signal(signal_data, wallet_data, use_llm=CONFIG.use_llm)
         
         if decision.get('llm_called'):
             self.diagnostics.llm_calls += 1
         
-        print(f"     Base: {decision.get('base_score', 0):.0f} | LLM: {decision.get('llm_adjustment', 0):+.0f} | Final: {decision.get('conviction_score', 0):.0f}")
-        
         if decision.get('should_enter') and self.paper_engine:
-            pos_id = self.paper_engine.open_position(signal_data, decision, token_info.get('price_usd', 0))
+            price = token_info.get('price_usd', 0)
             
-            if pos_id:
-                self.diagnostics.positions_opened += 1
-                self.diagnostics.log_event('POSITION_OPENED', f"${signal_data['token_symbol']} ID:{pos_id}")
-                print(f"     ✅ POSITION OPENED (ID: {pos_id})")
+            if price > 0:
+                pos_id = self.paper_engine.open_position(signal_data, decision, price)
                 
-                if self.notifier:
-                    self.notifier.send_entry_alert(signal_data, decision)
+                if pos_id:
+                    self.diagnostics.positions_opened += 1
+                    print(f"  📥 Position opened: ${token_info.get('symbol', '?')} (ID: {pos_id})")
+                    
+                    if self.notifier:
+                        self.notifier.send_entry_alert(signal_data, decision)
                 
                 result['action'] = 'POSITION_OPENED'
                 result['position_id'] = pos_id
@@ -453,56 +813,54 @@ class TradingSystem:
         return result
     
     def _close_position(self, position: Dict, reason: str, price: float):
+        """Close position with FIXED notification (passes result for accurate hold time)"""
         if self.paper_engine:
             result = self.paper_engine.close_position(position['id'], reason, price)
             
             if result:
                 self.diagnostics.positions_closed += 1
-                print(f"  📤 CLOSED: ${position.get('token_symbol', '?')} | {reason} | {result.get('pnl_pct', 0):+.1f}%")
+                print(f"  📤 CLOSED: ${position.get('token_symbol', '?')} | {result['pnl_pct']:+.1f}% | Hold: {result['hold_minutes']:.0f}m")
                 
+                # ============================================================
+                # CHANGE 4: Pass result to send_exit_alert for accurate hold time
+                # ============================================================
                 if self.notifier:
-                    self.notifier.send_exit_alert(position, reason, result.get('pnl_pct', 0))
+                    self.notifier.send_exit_alert(position, reason, result['pnl_pct'], result)
     
-    def _parse_webhook_swap(self, tx: Dict, wallet_address: str) -> Optional[Dict]:
+    def _parse_webhook_swap(self, tx: Dict, wallet: str) -> Optional[Dict]:
         try:
             token_transfers = tx.get('tokenTransfers', [])
             native_transfers = tx.get('nativeTransfers', [])
             
-            sol_in, sol_out = 0, 0
-            tokens_in, tokens_out = {}, {}
-            WSOL = "So11111111111111111111111111111111111111112"
+            tokens_in = {}
+            tokens_out = {}
+            sol_in = 0
+            sol_out = 0
             
-            for transfer in token_transfers:
-                mint = transfer.get('mint', '')
-                amount = float(transfer.get('tokenAmount', 0))
-                from_addr = transfer.get('fromUserAccount', '')
-                to_addr = transfer.get('toUserAccount', '')
-                
-                if from_addr == wallet_address:
-                    if mint == WSOL:
-                        sol_out += amount
-                    else:
-                        tokens_out[mint] = tokens_out.get(mint, 0) + amount
-                elif to_addr == wallet_address:
-                    if mint == WSOL:
-                        sol_in += amount
-                    else:
-                        tokens_in[mint] = tokens_in.get(mint, 0) + amount
+            SOL_MINT = "So11111111111111111111111111111111111111112"
             
-            for transfer in native_transfers:
-                amount = float(transfer.get('amount', 0)) / 1e9
-                from_addr = transfer.get('fromUserAccount', '')
-                to_addr = transfer.get('toUserAccount', '')
-                
-                if from_addr == wallet_address:
-                    sol_out += amount
-                elif to_addr == wallet_address:
+            for t in token_transfers:
+                mint = t.get('mint', '')
+                if mint == SOL_MINT:
+                    continue
+                amount = t.get('tokenAmount', 0)
+                if t.get('toUserAccount') == wallet:
+                    tokens_in[mint] = tokens_in.get(mint, 0) + amount
+                elif t.get('fromUserAccount') == wallet:
+                    tokens_out[mint] = tokens_out.get(mint, 0) + amount
+            
+            for t in native_transfers:
+                amount = t.get('amount', 0) / 1e9
+                if t.get('toUserAccount') == wallet:
                     sol_in += amount
+                elif t.get('fromUserAccount') == wallet:
+                    sol_out += amount
             
             if len(tokens_in) == 1 and sol_out > 0:
                 token_addr = list(tokens_in.keys())[0]
                 return {'type': 'BUY', 'token_address': token_addr, 'amount': tokens_in[token_addr], 'sol_amount': sol_out}
-            elif len(tokens_out) == 1 and sol_in > 0:
+            
+            if len(tokens_out) == 1 and sol_in > 0:
                 token_addr = list(tokens_out.keys())[0]
                 return {'type': 'SELL', 'token_address': token_addr, 'amount': tokens_out[token_addr], 'sol_amount': sol_in}
             
@@ -547,7 +905,6 @@ class TradingSystem:
         
         self.diagnostics.discoveries_run += 1
         
-        # UPDATED: Pass the budget parameters from config
         current_count = self.db.get_wallet_count()
         max_wallets = discovery_config.get_max_wallets_this_cycle(current_count)
         api_budget = discovery_config.max_api_calls_per_discovery
@@ -581,6 +938,12 @@ class TradingSystem:
         
         if self.paper_engine:
             diag['paper_trading'] = self.paper_engine.get_stats()
+            diag['learning'] = {
+                'phase': diag['paper_trading'].get('phase'),
+                'iteration': diag['paper_trading'].get('iteration'),
+                'blocked_hours': diag['paper_trading'].get('blocked_hours'),
+                'preferred_hours': diag['paper_trading'].get('preferred_hours')
+            }
         
         return diag
 
@@ -625,12 +988,34 @@ def helius_webhook():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
+# ============================================================================
+# CHANGE 6: Updated /status endpoint with learning info
+# ============================================================================
 @app.route('/status', methods=['GET'])
 def status():
     global trading_system
     if not trading_system:
         return jsonify({"status": "not_initialized"}), 500
-    return jsonify({"status": "running", "uptime_hours": trading_system.diagnostics.to_dict()['uptime_hours']}), 200
+    
+    stats = trading_system.paper_engine.get_stats() if trading_system.paper_engine else {}
+    
+    return jsonify({
+        "status": "running",
+        "uptime_hours": trading_system.diagnostics.to_dict()['uptime_hours'],
+        "paper_trading": {
+            "balance": stats.get('balance', 0),
+            "return_pct": stats.get('return_pct', 0),
+            "open_positions": stats.get('open_positions', 0),
+            "total_trades": stats.get('total_trades', 0),
+            "win_rate": stats.get('win_rate', 0)
+        },
+        "learning": {
+            "phase": stats.get('phase'),
+            "iteration": stats.get('iteration'),
+            "blocked_hours": stats.get('blocked_hours'),
+            "preferred_hours": stats.get('preferred_hours')
+        }
+    }), 200
 
 
 @app.route('/diagnostics', methods=['GET'])
@@ -692,8 +1077,12 @@ def trigger_learning():
         return jsonify({"status": "error", "message": "System not initialized"}), 500
     
     try:
-        result = trading_system.strategist.run_learning_loop(force=True)
-        return jsonify({"status": "success", "result": result}), 200
+        if trading_system.paper_engine:
+            result = trading_system.paper_engine.run_learning(force=True, notifier=trading_system.notifier)
+            trading_system.diagnostics.learning_iterations += 1
+            return jsonify({"status": "success", "result": result}), 200
+        else:
+            return jsonify({"status": "error", "message": "Paper trading not enabled"}), 400
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
@@ -707,18 +1096,54 @@ def learning_insights():
     
     try:
         insights = trading_system.strategist.get_learning_insights()
+        
+        if trading_system.paper_engine:
+            insights['paper_trading_feedback'] = trading_system.paper_engine.get_strategy_feedback()
+        
         return jsonify({"status": "success", "insights": insights}), 200
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
+# ============================================================================
+# CHANGE 7: New /learning/diurnal endpoint
+# ============================================================================
+@app.route('/learning/diurnal', methods=['GET'])
+def diurnal_report():
+    """Get diurnal (time-of-day) performance report"""
+    global trading_system
+    if not trading_system:
+        return jsonify({"status": "error", "message": "System not initialized"}), 500
+    
+    try:
+        if trading_system.paper_engine:
+            report = trading_system.paper_engine.get_diurnal_report()
+            stats = trading_system.paper_engine.get_stats()
+            
+            return jsonify({
+                "status": "success",
+                "phase": stats.get('phase'),
+                "iteration": stats.get('iteration'),
+                "blocked_hours": stats.get('blocked_hours'),
+                "preferred_hours": stats.get('preferred_hours'),
+                "hourly_performance": report
+            }), 200
+        else:
+            return jsonify({"status": "error", "message": "Paper trading not enabled"}), 400
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+# ============================================================================
+# CHANGE 5: Updated background_tasks with learning loop
+# ============================================================================
 def background_tasks():
     global trading_system
     
     last_position_check = time.time()
     last_status_print = time.time()
-    last_discovery = time.time() - 82800  # Start ~23h ago to trigger soon
-    last_learning = time.time() - 18000   # Start ~5h ago to trigger within first hour
+    last_discovery = time.time() - 82800
+    last_learning = time.time() - 18000  # Start ~5h ago
     
     while True:
         time.sleep(60)
@@ -735,40 +1160,17 @@ def background_tasks():
             except Exception as e:
                 print(f"Position check error: {e}")
         
-        # UPDATED: Use CONFIG property which reads from discovery_config
-        discovery_interval_seconds = CONFIG.discovery_interval_hours * 3600
-        
-        if CONFIG.discovery_enabled and (now - last_discovery >= discovery_interval_seconds):
+        discovery_interval = CONFIG.discovery_interval_hours * 3600
+        if now - last_discovery >= discovery_interval:
             last_discovery = now
-            
-            wallet_count = trading_system.db.get_wallet_count()
-            
-            if wallet_count >= discovery_config.max_total_wallets:
-                print(f"\n⚠️ Already have {wallet_count} wallets - skipping discovery")
-                continue
-            
             try:
-                print("\n" + "="*70)
-                print(f"🔍 RUNNING WALLET DISCOVERY ({CONFIG.discovery_interval_hours}h cycle)")
-                print(f"   Budget: {CONFIG.discovery_api_budget:,} credits")
-                print("="*70)
+                stats = trading_system.run_discovery()
                 
-                discovery_stats = trading_system.run_discovery()
-                
-                print(f"\n✅ Discovery complete:")
-                print(f"   Tokens scanned: {discovery_stats.get('tokens_discovered', 0)}")
-                print(f"   Candidates found: {discovery_stats.get('wallet_candidates_found', 0)}")
-                print(f"   Pre-filtered out: {discovery_stats.get('wallets_prefiltered_out', 0)}")
-                print(f"   Wallets profiled: {discovery_stats.get('wallets_profiled', 0)}")
-                print(f"   Wallets verified: {discovery_stats.get('wallets_verified', 0)}")
-                print(f"   API calls used: {discovery_stats.get('helius_api_calls', 0):,}")
-                
-                # Report webhook additions (note: may differ from verified count if rate limited)
-                wallets_added = discovery_stats.get('wallets_added_to_webhook', discovery_stats.get('wallets_verified', 0))
-                wallets_failed = discovery_stats.get('wallets_failed_webhook', 0)
+                wallets_added = stats.get('wallets_added_to_webhook', 0)
+                wallets_failed = stats.get('wallets_failed_webhook', 0)
                 
                 if wallets_added > 0:
-                    print(f"\n✅ {wallets_added} wallet(s) added to webhook!")
+                    print(f"✅ {wallets_added} new wallet(s) discovered and added!")
                 if wallets_failed > 0:
                     print(f"⚠️  {wallets_failed} wallet(s) failed to add - run 'python multi_webhook_manager.py sync' to retry")
             except Exception as e:
@@ -783,26 +1185,57 @@ def background_tasks():
             if trading_system.paper_engine and trading_system.notifier:
                 trading_system.notifier.send_hourly_status(trading_system.diagnostics, trading_system.paper_engine.get_stats())
         
-        # LEARNING LOOP - runs every 6 hours
+        # ====================================================================
+        # LEARNING LOOP - runs every 6 hours using paper engine's learning
+        # ====================================================================
         learning_interval = 6 * 3600  # 6 hours
         if now - last_learning >= learning_interval:
             last_learning = now
             try:
                 print("\n" + "="*70)
-                print("🧠 RUNNING LEARNING LOOP")
+                print("🎓 RUNNING LEARNING LOOP")
                 print("="*70)
                 
-                learning_result = trading_system.strategist.run_learning_loop()
-                
-                if learning_result.get('status') == 'completed':
-                    print("✅ Learning loop completed")
+                if trading_system.paper_engine:
+                    learning_result = trading_system.paper_engine.run_learning(
+                        force=True,
+                        notifier=trading_system.notifier
+                    )
                     
-                    # Log any promotions
-                    if 'promotion' in learning_result:
-                        promo = learning_result['promotion']
+                    if learning_result.get('status') == 'completed':
+                        trading_system.diagnostics.learning_iterations += 1
+                        print("✅ Learning loop completed")
+                        
+                        phase = learning_result.get('phase', 'unknown')
+                        iteration = learning_result.get('iteration', 0)
+                        print(f"   Phase: {phase}")
+                        print(f"   Iteration: {iteration}")
+                        
+                        blocked = learning_result.get('blocked_hours', [])
+                        if blocked:
+                            print(f"   Blocked hours: {blocked}")
+                        
+                        if learning_result.get('phase_changed'):
+                            new_phase = learning_result.get('new_phase')
+                            print(f"   🎯 PHASE CHANGE: → {new_phase}")
+                            
+                            if trading_system.notifier and trading_system.notifier.enabled:
+                                trading_system.notifier.send(
+                                    f"🎓 <b>Learning Phase Change!</b>\n\n"
+                                    f"New phase: {new_phase}\n"
+                                    f"Iteration: {iteration}"
+                                )
+                    else:
+                        print(f"   Status: {learning_result.get('status', 'unknown')}")
+                
+                # Also run strategist learning
+                strategist_result = trading_system.strategist.run_learning_loop()
+                
+                if strategist_result.get('status') == 'completed':
+                    if 'promotion' in strategist_result:
+                        promo = strategist_result['promotion']
                         print(f"🏆 Strategy promoted: {promo.get('new_champion', 'Unknown')}")
                         
-                        # Notify via Telegram if available
                         if trading_system.notifier and trading_system.notifier.enabled:
                             trading_system.notifier.send(
                                 f"🏆 <b>Strategy Promotion!</b>\n\n"
@@ -825,14 +1258,16 @@ def main():
         bg_thread.start()
         print(f"\n🔄 Background tasks running")
         
-        print(f"\n🎧 WEBHOOK SERVER STARTING")
+        print(f"\n🎧 WEBHOOK SERVER STARTING (LEARNING MODE)")
         print(f"   Webhook:     http://{CONFIG.webhook_host}:{CONFIG.webhook_port}/webhook/helius")
         print(f"   Status:      http://{CONFIG.webhook_host}:{CONFIG.webhook_port}/status")
         print(f"   Diagnostics: http://{CONFIG.webhook_host}:{CONFIG.webhook_port}/diagnostics")
+        print(f"   Positions:   http://{CONFIG.webhook_host}:{CONFIG.webhook_port}/positions")
         print(f"   New Wallets: http://{CONFIG.webhook_host}:{CONFIG.webhook_port}/new_wallets")
         print(f"   Discovery:   POST http://{CONFIG.webhook_host}:{CONFIG.webhook_port}/discovery/run")
         print(f"   Learning:    POST http://{CONFIG.webhook_host}:{CONFIG.webhook_port}/learning/run")
         print(f"   Insights:    GET  http://{CONFIG.webhook_host}:{CONFIG.webhook_port}/learning/insights")
+        print(f"   Diurnal:     GET  http://{CONFIG.webhook_host}:{CONFIG.webhook_port}/learning/diurnal")
         print(f"   Test:        http://{CONFIG.webhook_host}:{CONFIG.webhook_port}/test")
         print(f"\n   Press Ctrl+C to stop\n")
         
@@ -842,6 +1277,8 @@ def main():
         print("\n\n👋 Shutting down...")
         if trading_system:
             trading_system._print_status()
+            if trading_system.paper_engine:
+                trading_system.paper_engine.stop()
     except Exception as e:
         print(f"\n💥 FATAL ERROR: {e}")
         import traceback
