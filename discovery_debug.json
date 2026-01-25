@@ -1,0 +1,52 @@
+{
+  "timestamp": "2026-01-25T15:05:18.584184",
+  "stats": {
+    "candidates_found": 10,
+    "from_birdeye": 0,
+    "from_new_tokens": 9,
+    "from_reverse": 1,
+    "validated": 10,
+    "profiled": 10,
+    "verified": 3,
+    "verified_wallets": [
+      {
+        "address": "CoRWX2cFsGscybDKCHWXrrYzegA76YG4uYwSSE6sfZLU",
+        "win_rate": 1.0,
+        "pnl_sol": 5.842364314,
+        "completed_swings": 5,
+        "source": "new_token"
+      },
+      {
+        "address": "CP1iLuLCC8y6bjMfFDSb2DrK1rUDbDszWECmtaHGCziZ",
+        "win_rate": 1.0,
+        "pnl_sol": 1.2854761079075077,
+        "completed_swings": 1,
+        "source": "new_token"
+      },
+      {
+        "address": "FZpvKnMPQVxayKvBz55dzCFUCTxLaVe2k9dqhKG2Qjhr",
+        "win_rate": 0.5833333333333334,
+        "pnl_sol": 1.0145456979932348,
+        "completed_swings": 12,
+        "source": "new_token"
+      }
+    ],
+    "api_credits_used": 300
+  },
+  "budget": {
+    "total": 1000,
+    "used": 300,
+    "breakdown": {
+      "reverse_signatures": 20,
+      "reverse_parse": 200,
+      "validate_signatures": 10,
+      "validate_parse": 20,
+      "profile_get_swaps": 50
+    }
+  },
+  "config": {
+    "min_win_rate": 0.5,
+    "min_pnl_sol": 0.5,
+    "min_completed_swings": 1
+  }
+}

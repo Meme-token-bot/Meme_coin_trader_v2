@@ -123,7 +123,17 @@ class DiagnosticsTracker:
     llm_calls: int = 0
     discoveries_run: int = 0
     wallets_discovered: int = 0
-    learning_iterations: int = 0  # NEW: Track learning iterations
+    learning_iterations: int = 0
+    # NEW: Debug counters for webhook processing
+    buy_signals_detected: int = 0
+    sell_signals_detected: int = 0
+    untracked_wallet_skips: int = 0
+    duplicate_sig_skips: int = 0
+    non_swap_skips: int = 0
+    parse_failures: int = 0
+    token_info_failures: int = 0
+    learning_filter_passes: int = 0
+    learning_filter_fails: int = 0
     recent_events: deque = field(default_factory=lambda: deque(maxlen=50))
     
     def log_event(self, event_type: str, details: str = ""):
@@ -143,8 +153,22 @@ class DiagnosticsTracker:
             'uptime_hours': uptime.total_seconds() / 3600,
             'last_webhook_received': self.last_webhook_received.isoformat() if self.last_webhook_received else None,
             'minutes_since_last_webhook': minutes_since_webhook,
-            'webhooks': {'received': self.webhooks_received, 'processed': self.webhooks_processed, 'skipped': self.webhooks_skipped},
-            'api': {'calls': self.api_calls_made, 'errors': self.api_errors},
+            'webhooks': {
+                'received': self.webhooks_received, 
+                'processed': self.webhooks_processed, 
+                'skipped': self.webhooks_skipped,
+                'skip_reasons': {
+                    'untracked_wallet': self.untracked_wallet_skips,
+                    'duplicate_sig': self.duplicate_sig_skips,
+                    'non_swap': self.non_swap_skips,
+                    'parse_failures': self.parse_failures,
+                }
+            },
+            'signals': {
+                'buy_detected': self.buy_signals_detected,
+                'sell_detected': self.sell_signals_detected,
+            },
+            'api': {'calls': self.api_calls_made, 'errors': self.api_errors, 'token_info_failures': self.token_info_failures},
             'positions': {'opened': self.positions_opened, 'closed': self.positions_closed},
             'discovery': {'runs': self.discoveries_run, 'wallets_found': self.wallets_discovered},
             'learning_iterations': self.learning_iterations,
@@ -293,16 +317,26 @@ Avg Hold: {performance.get('avg_hold_hours', 0):.1f}h
         iteration = paper_stats.get('iteration', 0)
         blocked_hours = paper_stats.get('blocked_hours', [])
         
+        # Include webhook breakdown
+        d = diagnostics
+        
         msg = f"""📊 <b>Hourly Status</b>
 
 Uptime: {diag['uptime_hours']:.1f}h
-Webhooks: {diag['webhooks']['received']} received
+Webhooks: {d.webhooks_received} received
 Last webhook: {last_webhook}
 Paper: {paper_stats.get('balance', 0):.2f} SOL ({paper_stats.get('return_pct', 0):+.1f}%)
 Open positions: {paper_stats.get('open_positions', 0)}
 Win rate: {paper_stats.get('win_rate', 0):.0%}
 
-🎓 Learning:
+📈 <b>Webhook Breakdown:</b>
+• Processed: {d.webhooks_processed}
+• BUY signals: {d.buy_signals_detected}
+• SELL signals: {d.sell_signals_detected}
+• Positions opened: {d.positions_opened}
+• Skip: {d.untracked_wallet_skips} untracked, {d.non_swap_skips} non-swap
+
+🎓 <b>Learning:</b>
 Phase: {phase}
 Iteration: {iteration}
 Blocked hours: {blocked_hours if blocked_hours else 'None'}"""
@@ -659,6 +693,20 @@ class TradingSystem:
         rate_stats = self.rate_limiter.get_stats()
         print(f"  Rate limit: {rate_stats['calls_last_hour']}/{rate_stats['limit_per_hour']} calls/hr")
         
+        # DEBUG: Webhook breakdown
+        d = self.diagnostics
+        print(f"\n📈 Webhook Breakdown:")
+        print(f"  Total received: {d.webhooks_received}")
+        print(f"  Processed: {d.webhooks_processed} | Skipped: {d.webhooks_skipped}")
+        print(f"  Skip reasons:")
+        print(f"    - Untracked wallet: {d.untracked_wallet_skips}")
+        print(f"    - Duplicate sig: {d.duplicate_sig_skips}")
+        print(f"    - Non-swap: {d.non_swap_skips}")
+        print(f"    - Parse failures: {d.parse_failures}")
+        print(f"  Signals: {d.buy_signals_detected} BUY | {d.sell_signals_detected} SELL")
+        print(f"  Token info failures: {d.token_info_failures}")
+        print(f"  Positions opened: {d.positions_opened}")
+        
         print(f"\n📋 Discovery Config:")
         print(f"  Interval: {CONFIG.discovery_interval_hours}h")
         print(f"  Budget: {CONFIG.discovery_api_budget:,} credits")
@@ -677,16 +725,19 @@ class TradingSystem:
         
         if not self.db.is_wallet_tracked(fee_payer):
             self.diagnostics.webhooks_skipped += 1
+            self.diagnostics.untracked_wallet_skips += 1
             result['reason'] = 'Wallet not tracked'
             return result
         
         if self.db.is_signature_processed(signature):
             self.diagnostics.webhooks_skipped += 1
+            self.diagnostics.duplicate_sig_skips += 1
             result['reason'] = 'Already processed'
             return result
         
         if tx_type != 'SWAP':
             self.diagnostics.webhooks_skipped += 1
+            self.diagnostics.non_swap_skips += 1
             result['reason'] = f'Not a swap: {tx_type}'
             return result
         
@@ -694,6 +745,7 @@ class TradingSystem:
         
         if not trade:
             self.diagnostics.webhooks_skipped += 1
+            self.diagnostics.parse_failures += 1
             result['reason'] = 'Could not parse trade'
             return result
         
@@ -716,8 +768,10 @@ class TradingSystem:
         self.diagnostics.log_event('TRADE_DETECTED', f"{trade['type']} from {fee_payer[:8]}...")
         
         if trade['type'] == 'BUY':
+            self.diagnostics.buy_signals_detected += 1
             return self._process_buy(trade, wallet_data, token_addr, signature)
         elif trade['type'] == 'SELL':
+            self.diagnostics.sell_signals_detected += 1
             return self._process_sell(trade, wallet_data, token_addr, fee_payer)
         
         return result
@@ -741,13 +795,19 @@ class TradingSystem:
         
         if not token_info:
             self.diagnostics.api_errors += 1
+            self.diagnostics.token_info_failures += 1
             result['reason'] = 'Could not get token info'
+            return result
+        
+        price = token_info.get('price_usd', 0)
+        if price <= 0:
+            result['reason'] = 'Invalid price'
             return result
         
         signal_data = {
             'token_address': token_addr,
             'token_symbol': token_info.get('symbol', 'UNKNOWN'),
-            'price': token_info.get('price_usd', 0),
+            'price': price,
             'liquidity': token_info.get('liquidity_usd', 0),
             'volume_24h': token_info.get('volume_24h', 0),
             'market_cap': token_info.get('market_cap', 0),
@@ -758,23 +818,88 @@ class TradingSystem:
             'wallet_cluster': wallet_data.get('cluster', 'UNKNOWN')
         }
         
+        # ====================================================================
+        # LEARNING MODE: Bypass strict strategist filters, be PERMISSIVE
+        # ====================================================================
+        if self.paper_engine and hasattr(self.paper_engine, '_trader'):
+            # We're in learning mode - use relaxed criteria
+            wallet_wr = wallet_data.get('win_rate', 0.5)
+            liquidity = token_info.get('liquidity_usd', 0)
+            
+            # LEARNING MODE FILTERS (very permissive):
+            # - Any liquidity > $5k (was $30k)
+            # - Wallet win rate > 40% (was implied 50%+)
+            # - Token has a price
+            
+            should_enter_learning = (
+                liquidity >= 5000 and  # Relaxed from $30k
+                wallet_wr >= 0.40 and  # Relaxed threshold
+                price > 0
+            )
+            
+            if should_enter_learning:
+                # Build a permissive decision for learning
+                conviction = 50 + (wallet_wr * 40)  # 50-90 based on wallet WR
+                
+                decision = {
+                    'should_enter': True,
+                    'conviction_score': conviction,
+                    'position_size_sol': 0.3,  # Fixed small size for learning
+                    'stop_loss': -0.15,  # 15% stop loss
+                    'take_profit': 0.30,  # 30% take profit
+                    'trailing_stop': 0.10,  # 10% trailing
+                    'max_hold_hours': 12,
+                    'regime': self.strategist.regime_detector.current_regime,
+                    'wallet_count': 1,
+                    'reason': f'LEARNING MODE: WR={wallet_wr:.0%}, Liq=${liquidity:,.0f}',
+                    'llm_called': False,
+                    'learning_mode': True
+                }
+                
+                print(f"\n  🎓 LEARNING MODE: Opening position for ${signal_data['token_symbol']}")
+                print(f"     Wallet WR: {wallet_wr:.0%} | Liquidity: ${liquidity:,.0f}")
+                
+                pos_id = self.paper_engine.open_position(signal_data, decision, price)
+                
+                if pos_id:
+                    self.diagnostics.positions_opened += 1
+                    print(f"     ✅ POSITION OPENED (ID: {pos_id})")
+                    
+                    if self.notifier:
+                        self.notifier.send_entry_alert(signal_data, decision)
+                    
+                    result['action'] = 'POSITION_OPENED'
+                    result['position_id'] = pos_id
+                    return result
+                else:
+                    print(f"     ⚠️ Position open failed")
+            else:
+                skip_reason = []
+                if liquidity < 5000:
+                    skip_reason.append(f'Low liq: ${liquidity:,.0f}')
+                if wallet_wr < 0.40:
+                    skip_reason.append(f'Low WR: {wallet_wr:.0%}')
+                print(f"  ⏭️ LEARNING SKIP: {', '.join(skip_reason)}")
+                result['reason'] = f"Learning filter: {', '.join(skip_reason)}"
+                return result
+        
+        # ====================================================================
+        # NORMAL MODE: Use strategist (for when not in learning)
+        # ====================================================================
         decision = self.strategist.analyze_signal(signal_data, wallet_data, use_llm=CONFIG.use_llm)
         
         if decision.get('llm_called'):
             self.diagnostics.llm_calls += 1
         
         if decision.get('should_enter') and self.paper_engine:
-            price = token_info.get('price_usd', 0)
+            pos_id = self.paper_engine.open_position(signal_data, decision, price)
             
-            if price > 0:
-                pos_id = self.paper_engine.open_position(signal_data, decision, price)
+            if pos_id:
+                self.diagnostics.positions_opened += 1
+                print(f"  📥 Position opened: ${token_info.get('symbol', '?')} (ID: {pos_id})")
                 
-                if pos_id:
-                    self.diagnostics.positions_opened += 1
-                    print(f"  📥 Position opened: ${token_info.get('symbol', '?')} (ID: {pos_id})")
-                    
-                    if self.notifier:
-                        self.notifier.send_entry_alert(signal_data, decision)
+                if self.notifier:
+                    self.notifier.send_entry_alert(signal_data, decision)
                 
                 result['action'] = 'POSITION_OPENED'
                 result['position_id'] = pos_id
