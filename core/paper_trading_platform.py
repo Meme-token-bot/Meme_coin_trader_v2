@@ -1623,6 +1623,9 @@ class RobustPaperTrader:
         self.total_pnl = 0.0
         self.open_position_count = 0
         
+        # Callback for exit notifications (set by wrapper)
+        self.on_position_closed = None  # Callable[[Dict], None]
+        
         # Thread safety
         self._lock = threading.RLock()
         self._monitor_running = False
@@ -1658,15 +1661,15 @@ class RobustPaperTrader:
         else:
             self.watchdog = None
         
-        logger.info("=" * 60)
-        logger.info("🚀 ROBUST PAPER TRADER V5 INITIALIZED")
-        logger.info("=" * 60)
-        logger.info(f"   Balance: {self.balance:.4f} SOL")
-        logger.info(f"   Open Positions: {self.open_position_count}")
-        logger.info(f"   Watchdog: {'ENABLED' if enable_watchdog else 'DISABLED'}")
-        logger.info(f"   Baseline Tracking: {'ENABLED' if enable_baseline_tracking else 'DISABLED'}")
-        logger.info(f"   Historical Storage: {'ENABLED' if enable_historical_storage else 'DISABLED'}")
-        logger.info("=" * 60)
+        print("=" * 60)
+        print("🚀 ROBUST PAPER TRADER V5 INITIALIZED")
+        print("=" * 60)
+        print(f"   Balance: {self.balance:.4f} SOL")
+        print(f"   Open Positions: {self.open_position_count}")
+        print(f"   Watchdog: {'ENABLED' if enable_watchdog else 'DISABLED'}")
+        print(f"   Baseline Tracking: {'ENABLED' if enable_baseline_tracking else 'DISABLED'}")
+        print(f"   Historical Storage: {'ENABLED' if enable_historical_storage else 'DISABLED'}")
+        print("=" * 60)
     
     def _init_database(self):
         """Initialize the database"""
@@ -1922,7 +1925,7 @@ class RobustPaperTrader:
                 
                 position_id = cursor.lastrowid
                 
-                # Update account
+                # Update account - reserve funds (balance stays same, money moves to position)
                 self.reserved_balance += size_sol
                 conn.execute("""
                     UPDATE paper_account_v5
@@ -1973,8 +1976,8 @@ class RobustPaperTrader:
                 """, (exit_price, datetime.utcnow(), exit_reason.value,
                       pnl_sol, pnl_pct, hold_minutes, position_id))
                 
-                # Update account
-                self.balance += exit_value
+                # Update account - add only the PROFIT/LOSS, not full exit value!
+                self.balance += pnl_sol  # THIS IS THE FIX - was exit_value (wrong!)
                 self.reserved_balance -= size_sol
                 self.total_trades += 1
                 self.total_pnl += pnl_sol
@@ -2009,17 +2012,29 @@ class RobustPaperTrader:
             self.open_position_count -= 1
             
             emoji = "✅" if is_win else "❌"
-            logger.info(f"📤 CLOSED #{position_id}: {pos['token_symbol']} ({exit_reason.value})")
-            logger.info(f"   {emoji} PnL: {pnl_sol:+.4f} SOL ({pnl_pct:+.1f}%)")
-            logger.info(f"   Hold time: {hold_minutes:.0f} min")
+            # ALWAYS print closes (important events)
+            print(f"  {emoji} CLOSED #{position_id}: {pos['token_symbol']} | "
+                  f"{exit_reason.value} | PnL: {pnl_pct:+.1f}% ({pnl_sol:+.4f} SOL) | "
+                  f"Hold: {hold_minutes:.0f}m")
             
-            return {
+            result = {
                 'position_id': position_id,
+                'token_symbol': pos['token_symbol'],
                 'pnl_sol': pnl_sol,
                 'pnl_pct': pnl_pct,
                 'hold_minutes': hold_minutes,
-                'exit_reason': exit_reason.value
+                'exit_reason': exit_reason.value,
+                'is_win': is_win
             }
+            
+            # Call exit callback if set (for Telegram notifications)
+            if self.on_position_closed:
+                try:
+                    self.on_position_closed(result)
+                except Exception as e:
+                    logger.error(f"Exit callback error: {e}")
+            
+            return result
     
     def get_open_positions(self) -> List[Dict]:
         """Get all open positions"""
@@ -2057,7 +2072,7 @@ class RobustPaperTrader:
         self._monitor_running = True
         self._monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
         self._monitor_thread.start()
-        logger.info("🔄 Exit monitor started")
+        print("🔄 Exit monitor started (checking every 30s)")
     
     def stop_monitor(self):
         """Stop exit monitoring"""
@@ -2067,21 +2082,25 @@ class RobustPaperTrader:
     
     def _monitor_loop(self):
         """Background monitoring loop"""
+        check_count = 0
         while self._monitor_running:
             try:
-                self._check_all_exits()
+                positions = self.get_open_positions()
+                check_count += 1
+                
+                # Log every 10th check (every 5 min) to confirm monitor is alive
+                if check_count % 10 == 0:
+                    print(f"  💓 Exit monitor alive: {len(positions)} open positions")
+                
+                for pos in positions:
+                    try:
+                        self._check_position_exit(pos)
+                    except Exception as e:
+                        logger.error(f"Error checking position {pos['id']}: {e}")
+                        
             except Exception as e:
                 logger.error(f"Monitor error: {e}")
             time.sleep(30)
-    
-    def _check_all_exits(self):
-        """Check all positions for exit conditions"""
-        positions = self.get_open_positions()
-        for pos in positions:
-            try:
-                self._check_position_exit(pos)
-            except Exception as e:
-                logger.error(f"Error checking position {pos['id']}: {e}")
     
     def _check_position_exit(self, pos: Dict):
         """Check single position for exit"""

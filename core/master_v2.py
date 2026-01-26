@@ -205,13 +205,28 @@ class DiagnosticsTracker:
 
 
 class Notifier:
-    """Telegram notifier with enhanced alerts"""
+    """
+    Telegram notifier - MINIMAL notifications only.
+    
+    Sends:
+    - 30-minute status summaries
+    - Critical alerts (system issues, watchdog warnings)
+    - Daily performance summary
+    
+    Does NOT send:
+    - Individual entry/exit alerts (too noisy)
+    - Cluster signals (logged to console instead)
+    """
     
     def __init__(self, token: str = None, chat_id: str = None):
         self.token = token or os.getenv('TELEGRAM_BOT_TOKEN')
         self.chat_id = chat_id or os.getenv('TELEGRAM_CHAT_ID')
         self.enabled = bool(self.token and self.chat_id)
         self._last_status_sent = None
+        self._last_30min_update = datetime.now() - timedelta(minutes=30)
+        
+        # Track stats for 30-min delta reporting
+        self._last_stats = {}
     
     def send(self, message: str):
         if not self.enabled:
@@ -224,124 +239,110 @@ class Notifier:
             print(f"  ⚠️ Telegram error: {e}")
     
     def send_entry_alert(self, signal: Dict, decision: Dict, quality: SignalQualityMetrics = None):
-        """Send entry notification with quality metrics"""
-        current_hour = datetime.utcnow().hour
-        
-        cluster_str = "🔥 CLUSTER" if (quality and quality.is_cluster_signal) else ""
-        quality_score = quality.calculate_composite_score() if quality else 50
-        
-        msg = f"""🎯 <b>ENTRY SIGNAL</b> {cluster_str}
-
-Token: ${signal.get('token_symbol', 'UNKNOWN')}
-Conviction: {decision.get('conviction_score', 0):.0f}/100
-Quality: {quality_score:.0f}/100
-Wallets: {decision.get('wallet_count', 1)}
-Regime: {decision.get('regime', 'UNKNOWN')}
-Position: {decision.get('position_size_sol', 0):.3f} SOL
-Stop: {decision.get('stop_loss_pct', -15):.0f}%
-Target: {decision.get('take_profit_pct', 30):.0f}%
-Hour (UTC): {current_hour:02d}:00"""
-        self.send(msg)
+        """Entry alerts DISABLED - too noisy"""
+        pass  # Silently ignore
     
     def send_exit_alert(self, position: Dict, reason: str, pnl_pct: float, result: Dict = None):
-        """Send exit notification with hold time"""
-        emoji = "🟢" if pnl_pct > 0 else "🔴"
-        
-        hold_mins = self._get_hold_time(position, result)
-        
-        if hold_mins >= 60:
-            hold_str = f"{hold_mins/60:.1f}h ({hold_mins:.0f}m)"
-        else:
-            hold_str = f"{hold_mins:.0f} min"
-        
-        pnl_sol = result.get('pnl_sol', 0) if result else 0
-        
-        msg = f"""{emoji} <b>EXIT</b>
-
-Token: ${position.get('token_symbol', 'UNKNOWN')}
-Reason: {reason}
-P&L: {pnl_pct:+.1f}% ({pnl_sol:+.4f} SOL)
-Hold: {hold_str}"""
-        self.send(msg)
-    
-    def _get_hold_time(self, position: Dict, result: Dict = None) -> float:
-        """Extract hold time from various sources"""
-        if result:
-            if 'hold_minutes' in result:
-                return result['hold_minutes']
-            if 'hold_duration_minutes' in result:
-                return result['hold_duration_minutes']
-        
-        if 'hold_duration_minutes' in position:
-            return position['hold_duration_minutes']
-        
-        entry_time = position.get('entry_time')
-        if entry_time:
-            if isinstance(entry_time, str):
-                entry_time = datetime.fromisoformat(entry_time.replace('Z', ''))
-            return (datetime.utcnow() - entry_time).total_seconds() / 60
-        
-        return 0
-    
-    def send_hourly_status(self, stats: Dict, diag: Dict, learning_stats: Dict = None):
-        """Send hourly status with platform metrics"""
-        uptime_hours = diag.get('uptime_hours', 0)
-        
-        msg = f"""📊 <b>Hourly Status</b>
-
-Uptime: {uptime_hours:.1f}h
-Webhooks: {diag['webhooks']['received']} received
-Last webhook: {diag.get('minutes_since_last_webhook', 0):.0f}m ago
-Paper: {stats.get('balance', 0):.2f} SOL ({stats.get('return_pct', 0):+.1f}%)
-Open positions: {stats.get('open_positions', 0)}
-Win rate: {stats.get('win_rate', 0):.0%}
-
-📈 <b>Webhook Breakdown:</b>
-• Processed: {diag['webhooks']['processed']}
-• BUY signals: {diag['signals']['buy_detected']}
-• SELL signals: {diag['signals']['sell_detected']}
-• Positions opened: {diag['positions']['opened']}
-• Skip: {diag['webhooks']['skip_reasons']['untracked_wallet']} untracked, {diag['webhooks']['skip_reasons']['non_swap']} non-swap
-
-🔥 <b>Quality Metrics:</b>
-• Cluster signals: {diag['signals'].get('cluster_signals', 0)}
-• High conviction: {diag['signals'].get('high_conviction', 0)}
-• Baseline recorded: {diag.get('baseline_signals_recorded', 0)}"""
-
-        if learning_stats:
-            msg += f"""
-
-🧪 <b>Learning:</b>
-Phase: {learning_stats.get('phase', 'exploration')}
-Iteration: {learning_stats.get('iteration', 0)}
-Blocked hours: {learning_stats.get('blocked_hours', 'None') or 'None'}"""
-        
-        self.send(msg)
+        """Exit alerts DISABLED - too noisy"""
+        pass  # Silently ignore
     
     def send_cluster_alert(self, token_symbol: str, wallet_count: int, wallets: List[str]):
-        """Send alert when cluster signal detected"""
-        wallet_preview = ", ".join(w[:8] + "..." for w in wallets[:3])
-        msg = f"""🔥 <b>CLUSTER SIGNAL DETECTED</b>
+        """Cluster alerts DISABLED - logged to console only"""
+        pass  # Silently ignore
+    
+    def send_critical_alert(self, message: str):
+        """Send critical system alert - ALWAYS sends"""
+        self.send(f"🚨 <b>CRITICAL ALERT</b>\n\n{message}")
+    
+    def send_30min_update(self, stats: Dict, diag: Dict):
+        """
+        Send 30-minute status update with deltas.
+        
+        Shows what changed in the last 30 minutes.
+        """
+        now = datetime.now()
+        
+        # Check if 30 minutes have passed
+        if (now - self._last_30min_update).total_seconds() < 1800:
+            return
+        
+        self._last_30min_update = now
+        
+        # Calculate deltas from last update
+        prev = self._last_stats
+        
+        new_positions = diag['positions']['opened'] - prev.get('opened', 0)
+        new_closes = (stats.get('total_trades', 0) - stats.get('open_positions', 0)) - prev.get('closed', 0)
+        pnl_delta = stats.get('total_pnl', 0) - prev.get('pnl', 0)
+        
+        # Store current stats for next delta
+        self._last_stats = {
+            'opened': diag['positions']['opened'],
+            'closed': stats.get('total_trades', 0) - stats.get('open_positions', 0),
+            'pnl': stats.get('total_pnl', 0),
+            'balance': stats.get('balance', 0),
+        }
+        
+        # Build message
+        emoji = "📈" if pnl_delta >= 0 else "📉"
+        
+        msg = f"""{emoji} <b>30-Min Update</b>
 
-Token: ${token_symbol}
-Wallets buying: {wallet_count}
-Wallets: {wallet_preview}
+<b>Account:</b>
+Balance: {stats.get('balance', 0):.2f} SOL ({stats.get('return_pct', 0):+.1f}%)
+Open: {stats.get('open_positions', 0)} positions
 
-Multiple smart wallets buying simultaneously!"""
+<b>Last 30 min:</b>
+Opened: {new_positions} | Closed: {new_closes}
+PnL: {pnl_delta:+.4f} SOL
+
+<b>Session totals:</b>
+Win rate: {stats.get('win_rate', 0):.0%}
+Total PnL: {stats.get('total_pnl', 0):+.4f} SOL
+Webhooks: {diag['webhooks']['received']}"""
+        
         self.send(msg)
     
+    def send_hourly_status(self, stats: Dict, diag: Dict, learning_stats: Dict = None):
+        """Hourly status - redirects to 30-min update"""
+        # Use 30-min update instead
+        self.send_30min_update(stats, diag)
+    
     def send_baseline_report(self, report: Dict):
-        """Send baseline comparison report"""
-        msg = "📊 <b>BASELINE COMPARISON (7 days)</b>\n\n"
-        
-        for baseline, data in report.items():
-            if data['entered'] > 0:
-                msg += f"<b>{baseline.upper()}</b>\n"
-                msg += f"  Entered: {data['entered']} | WR: {data['win_rate']:.0%} | PnL: {data['total_pnl_pct']:+.1f}%\n\n"
-        
-        # Find best
+        """Send baseline comparison - only if significant findings"""
+        # Only send if we have enough data and clear winner
         best = max(report.items(), key=lambda x: x[1].get('total_pnl_pct', 0))
-        msg += f"🏆 Best: {best[0].upper()} with {best[1]['total_pnl_pct']:+.1f}% PnL"
+        worst = min(report.items(), key=lambda x: x[1].get('total_pnl_pct', 0))
+        
+        # Only report if there's a meaningful difference
+        if best[1].get('entered', 0) < 20:
+            return  # Not enough data
+        
+        diff = best[1].get('total_pnl_pct', 0) - worst[1].get('total_pnl_pct', 0)
+        if abs(diff) < 10:
+            return  # Not significant enough
+        
+        msg = f"""📊 <b>Strategy Insight</b>
+
+Best: <b>{best[0].upper()}</b>
+PnL: {best[1]['total_pnl_pct']:+.1f}% | WR: {best[1]['win_rate']:.0%}
+
+vs Worst: {worst[0]}
+PnL: {worst[1]['total_pnl_pct']:+.1f}%
+
+Difference: {diff:+.1f}%"""
+        
+        self.send(msg)
+    
+    def send_daily_summary(self, stats: Dict):
+        """Send daily performance summary"""
+        msg = f"""📅 <b>Daily Summary</b>
+
+Balance: {stats.get('balance', 0):.2f} SOL
+Return: {stats.get('return_pct', 0):+.1f}%
+Trades: {stats.get('total_trades', 0)}
+Win Rate: {stats.get('win_rate', 0):.0%}
+Total PnL: {stats.get('total_pnl', 0):+.4f} SOL"""
         
         self.send(msg)
 
@@ -364,6 +365,7 @@ class RobustPaperTradingEngine:
     
     def __init__(self, db, starting_balance: float = 10.0, max_positions: int = None):
         self.db = db
+        self._notifier = None  # Set via set_notifier()
         
         # Initialize the robust trader with all features
         self._trader = RobustPaperTrader(
@@ -395,6 +397,25 @@ class RobustPaperTradingEngine:
         print(f"   Watchdog: {'ENABLED' if CONFIG.enable_watchdog else 'DISABLED'}")
         print(f"   Baseline Tracking: {'ENABLED' if CONFIG.enable_baseline_tracking else 'DISABLED'}")
         print(f"   Historical Storage: {'ENABLED' if CONFIG.enable_historical_storage else 'DISABLED'}")
+    
+    def set_notifier(self, notifier):
+        """Set notifier for exit alerts"""
+        self._notifier = notifier
+        # Set callback on trader for exit notifications
+        self._trader.on_position_closed = self._on_exit_callback
+    
+    def _on_exit_callback(self, result: Dict):
+        """Called when a position is closed"""
+        if self._notifier and hasattr(self._notifier, 'send_exit_alert'):
+            position = {
+                'token_symbol': result.get('token_symbol', 'UNKNOWN'),
+            }
+            self._notifier.send_exit_alert(
+                position,
+                result.get('exit_reason', 'UNKNOWN'),
+                result.get('pnl_pct', 0),
+                result
+            )
     
     @property
     def balance(self) -> float:
@@ -651,6 +672,8 @@ class TradingSystem:
                 starting_balance=CONFIG.paper_starting_balance,
                 max_positions=CONFIG.max_open_positions
             )
+            # Connect notifier for exit alerts
+            self.paper_engine.set_notifier(self.notifier)
             print(f"  ✅ Robust Paper Trading (Balance: {self.paper_engine.balance:.2f} SOL)")
         else:
             self.paper_engine = None
@@ -1254,7 +1277,7 @@ def background_tasks():
             
             now = datetime.now()
             
-            # Quick summary every 5 minutes (verbosity >= 1)
+            # Quick console summary every 5 minutes (verbosity >= 1)
             if CONFIG.verbosity >= 1 and (now - last_summary).total_seconds() >= 300:
                 last_summary = now
                 d = trading_system.diagnostics
@@ -1270,14 +1293,14 @@ def background_tasks():
                       f"Balance: {stats.get('balance', 0):.2f} SOL | "
                       f"Last: {mins_since:.0f}m ago")
             
-            # Hourly status
-            if (now - last_status).total_seconds() >= 3600:
+            # 30-minute Telegram update
+            if (now - last_status).total_seconds() >= 1800:  # 30 minutes
                 last_status = now
                 
                 if trading_system.paper_engine and trading_system.notifier:
                     stats = trading_system.paper_engine.get_stats()
                     diag = trading_system.diagnostics.to_dict()
-                    trading_system.notifier.send_hourly_status(stats, diag, stats)
+                    trading_system.notifier.send_30min_update(stats, diag)
             
             # Discovery
             if CONFIG.discovery_enabled:
