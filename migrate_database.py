@@ -56,7 +56,7 @@ class DatabaseAnalyzer:
             tables = conn.execute("""
                 SELECT name FROM sqlite_master WHERE type='table'
             """).fetchall()
-            table_names = [t['name'] for t in tables]
+            table_names = [t[0] for t in tables]
             print(f"\nTables found: {table_names}")
             
             # Find the account table (v3, v5, etc)
@@ -79,20 +79,24 @@ class DatabaseAnalyzer:
             print(f"\nUsing tables: {account_table}, {positions_table}")
             
             # Get account state
-            account = conn.execute(f"SELECT * FROM {account_table} WHERE id = 1").fetchone()
-            if account:
-                results['account'] = dict(account)
+            account_row = conn.execute(f"SELECT * FROM {account_table} WHERE id = 1").fetchone()
+            if account_row:
+                # Convert to dict for easier access
+                account = dict(account_row)
+                results['account'] = account
                 print(f"\n📊 ACCOUNT STATE:")
-                print(f"   Starting balance: {account['starting_balance']:.4f} SOL")
-                print(f"   Current balance:  {account['current_balance']:.4f} SOL")
+                print(f"   Starting balance: {account.get('starting_balance', 10):.4f} SOL")
+                print(f"   Current balance:  {account.get('current_balance', 0):.4f} SOL")
                 print(f"   Reserved balance: {account.get('reserved_balance', 0):.4f} SOL")
                 print(f"   Total trades:     {account.get('total_trades', 0)}")
                 print(f"   Winning trades:   {account.get('winning_trades', 0)}")
                 print(f"   Total PnL:        {account.get('total_pnl_sol', 0):+.4f} SOL")
                 
                 # Calculate return percentage
-                if account['starting_balance'] > 0:
-                    return_pct = ((account['current_balance'] / account['starting_balance']) - 1) * 100
+                starting = account.get('starting_balance', 10)
+                current = account.get('current_balance', 0)
+                if starting > 0:
+                    return_pct = ((current / starting) - 1) * 100
                     print(f"   Return:           {return_pct:+.1f}%")
             
             # Count positions by status
@@ -149,8 +153,8 @@ class DatabaseAnalyzer:
                     if correct_pnl > 0:
                         recalculated_wins += 1
                 
-                expected_balance = account['starting_balance'] + recalculated_pnl
-                actual_balance = account['current_balance']
+                expected_balance = account.get('starting_balance', 10) + recalculated_pnl
+                actual_balance = account.get('current_balance', 0)
                 discrepancy = actual_balance - expected_balance
                 
                 print(f"\n🔬 RECALCULATION:")
@@ -296,7 +300,7 @@ class DatabaseAnalyzer:
             tables = conn.execute("""
                 SELECT name FROM sqlite_master WHERE type='table'
             """).fetchall()
-            table_names = [t['name'] for t in tables]
+            table_names = [t[0] for t in tables]
             
             # Determine version
             if 'paper_account_v5' in table_names:
