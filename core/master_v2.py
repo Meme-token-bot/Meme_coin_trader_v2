@@ -22,7 +22,7 @@ import time
 import json
 import threading
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
 from collections import deque
 
@@ -40,7 +40,7 @@ from infrastructure.helius_webhook_manager import HeliusWebhookManager
 # ============================================================================
 # IMPORT FIXED V6 PAPER TRADING PLATFORM
 # ============================================================================
-from paper_trading_platform_v6_fixed import (
+from core.paper_trading_platform_v6_fixed import (
     RobustPaperTrader,
     SignalQualityAnalyzer,
     SignalQualityMetrics,
@@ -53,6 +53,9 @@ from paper_trading_platform_v6_fixed import (
     ExitReason,
     set_platform_verbosity
 )
+
+# Import strategy learner for actual learning
+from core.strategy_learner import StrategyLearner
 
 
 @dataclass
@@ -68,8 +71,11 @@ class MasterConfig:
     paper_starting_balance: float = 10.0
     use_llm: bool = True
     
-    # FIXED: Now actually enforced!
-    max_open_positions: int = 5
+    # Position limit - adjust based on phase:
+    # Learning mode: 100+ (gather lots of data)
+    # Refinement mode: 20-50 (testing stricter criteria)
+    # Production mode: 5-10 (only high conviction trades)
+    max_open_positions: int = 100
     
     max_position_size_sol: float = 0.3
     
@@ -299,7 +305,7 @@ class FixedPaperTradingEngine:
     3. ✅ Reliable exit monitoring with watchdog
     """
     
-    def __init__(self, db, starting_balance: float = 10.0, max_positions: int = 5):
+    def __init__(self, db, starting_balance: float = 10.0, max_positions: int = 100):
         self.db = db
         self._notifier = None
         
@@ -312,6 +318,9 @@ class FixedPaperTradingEngine:
             enable_baseline_tracking=CONFIG.enable_baseline_tracking,
             enable_historical_storage=CONFIG.enable_historical_storage
         )
+        
+        # Initialize STRATEGY LEARNER - this is where the magic happens!
+        self.strategy_learner = StrategyLearner(db_path="robust_paper_trades_v6.db")
         
         # Store references
         self.quality_analyzer = self._trader.quality_analyzer
@@ -328,6 +337,8 @@ class FixedPaperTradingEngine:
         print(f"🚀 FIXED V6 PAPER TRADING ENGINE initialized")
         print(f"   Balance: {self._trader.balance:.4f} SOL")
         print(f"   Positions: {self._trader.open_position_count}/{self._trader.max_open_positions}")
+        print(f"   Strategy Phase: {self.strategy_learner.config.phase}")
+        print(f"   Learning Iteration: {self.strategy_learner.config.iteration}")
     
     def set_notifier(self, notifier):
         self._notifier = notifier
@@ -405,21 +416,68 @@ class FixedPaperTradingEngine:
             self.baseline_tracker.print_comparison(days)
     
     def run_learning(self, force: bool = False, notifier=None) -> Dict:
+        """
+        Run the ACTUAL learning iteration.
+        
+        This analyzes closed trades to learn:
+        - Which wallet characteristics predict wins
+        - Which hours perform best
+        - Optimal exit parameters
+        
+        And updates strategy filters accordingly.
+        """
         if not force and (datetime.utcnow() - self._last_learning).total_seconds() < 6 * 3600:
-            return {'status': 'skipped'}
+            return {'status': 'skipped', 'reason': 'Not time yet'}
         
         self._last_learning = datetime.utcnow()
-        results = {'status': 'completed', 'timestamp': datetime.utcnow().isoformat()}
         
+        # Run the actual learning iteration
+        results = self.strategy_learner.run_learning_iteration()
+        
+        # Add baseline comparison
         if self.baseline_tracker:
             results['baseline_comparison'] = self.get_baseline_comparison()
-            if notifier:
-                try:
-                    notifier.send_baseline_report(results['baseline_comparison'])
-                except:
-                    pass
+        
+        # Send summary via Telegram
+        if notifier and results.get('status') == 'completed':
+            try:
+                self._send_learning_summary(notifier, results)
+            except Exception as e:
+                print(f"  ⚠️ Failed to send learning summary: {e}")
         
         return results
+    
+    def _send_learning_summary(self, notifier, results: Dict):
+        """Send learning results via Telegram"""
+        overall = results.get('overall', {})
+        actions = results.get('actions', [])
+        
+        msg = f"""🧠 <b>Learning Iteration #{self.strategy_learner.config.iteration}</b>
+
+<b>Performance:</b>
+Win Rate: {overall.get('win_rate', 0):.1%}
+Total PnL: {overall.get('total_pnl', 0):+.4f} SOL
+
+<b>Phase:</b> {self.strategy_learner.config.phase}
+
+<b>Current Filters:</b>
+Min Wallet WR: {self.strategy_learner.config.min_wallet_wr:.0%}
+Stop Loss: {self.strategy_learner.config.stop_loss_pct}%"""
+        
+        if actions:
+            msg += "\n\n<b>Changes Made:</b>"
+            for action in actions[:3]:
+                msg += f"\n• {action}"
+        
+        notifier.send(msg)
+    
+    def get_learned_filters(self) -> Dict:
+        """Get current learned filter settings"""
+        return self.strategy_learner.get_current_filters()
+    
+    def should_take_trade(self, signal: Dict, wallet_data: Dict) -> Tuple[bool, str]:
+        """Check if trade passes learned filters"""
+        return self.strategy_learner.should_take_trade(signal, wallet_data)
     
     def get_strategy_feedback(self) -> Dict:
         return {
@@ -676,6 +734,14 @@ class TradingSystem:
         if self.paper_engine:
             self.paper_engine.update_top_wallets(self.db)
             
+            # Check LEARNED filters first (from strategy learner)
+            should_trade, filter_reason = self.paper_engine.should_take_trade(signal_data, wallet_info)
+            if not should_trade:
+                self.diagnostics.webhooks_skipped += 1
+                result['reason'] = f"Learned filter: {filter_reason}"
+                return result
+            
+            # Basic wallet WR check (fallback if learner hasn't run yet)
             if wallet_wr < 0.30:
                 result['reason'] = f"Low wallet WR: {wallet_wr:.0%}"
                 return result
@@ -811,6 +877,62 @@ def reset_database():
     trading_system.paper_engine._trader.reset_database()
     return jsonify({'status': 'reset', 'balance': trading_system.paper_engine.balance})
 
+
+@app.route('/strategy', methods=['GET'])
+def get_strategy():
+    """Get current learned strategy configuration"""
+    global trading_system
+    if not trading_system or not trading_system.paper_engine:
+        return jsonify({'error': 'Paper trading not enabled'}), 503
+    
+    learner = trading_system.paper_engine.strategy_learner
+    
+    return jsonify({
+        'phase': learner.config.phase,
+        'iteration': learner.config.iteration,
+        'current_wr': learner.config.current_wr,
+        'target_wr': learner.config.target_wr,
+        'filters': learner.get_current_filters(),
+        'last_updated': learner.config.last_updated
+    })
+
+
+@app.route('/learning/run', methods=['POST'])
+def run_learning():
+    """Manually trigger a learning iteration"""
+    global trading_system
+    if not trading_system or not trading_system.paper_engine:
+        return jsonify({'error': 'Paper trading not enabled'}), 503
+    
+    force = request.args.get('force', 'true').lower() == 'true'
+    results = trading_system.paper_engine.run_learning(force=force, notifier=trading_system.notifier)
+    
+    return jsonify(results)
+
+
+@app.route('/learning/status', methods=['GET'])
+def learning_status():
+    """Get learning system status"""
+    global trading_system
+    if not trading_system or not trading_system.paper_engine:
+        return jsonify({'error': 'Paper trading not enabled'}), 503
+    
+    learner = trading_system.paper_engine.strategy_learner
+    
+    # Get recent trades summary
+    trades = learner.get_closed_trades(days=7)
+    
+    return jsonify({
+        'phase': learner.config.phase,
+        'iteration': learner.config.iteration,
+        'trades_last_7d': len(trades),
+        'current_wr': learner.config.current_wr,
+        'target_wr': learner.config.target_wr,
+        'min_wallet_wr': learner.config.min_wallet_wr,
+        'blocked_hours': learner.config.blocked_hours_utc,
+        'preferred_hours': learner.config.preferred_hours_utc,
+        'last_updated': learner.config.last_updated
+    })
 
 @app.route('/test', methods=['GET'])
 def test():

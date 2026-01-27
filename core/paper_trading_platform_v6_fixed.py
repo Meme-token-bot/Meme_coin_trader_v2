@@ -902,7 +902,7 @@ class RobustPaperTrader:
     def __init__(self, 
                  db_path: str = "robust_paper_trades_v6.db",
                  starting_balance: float = 10.0,
-                 max_open_positions: int = 5,  # ENFORCED NOW!
+                 max_open_positions: int = 100,  # Learning mode default
                  enable_watchdog: bool = True,
                  enable_baseline_tracking: bool = True,
                  enable_historical_storage: bool = True):
