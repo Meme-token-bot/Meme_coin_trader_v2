@@ -10,6 +10,7 @@ It analyzes closed trades to learn:
 3. Optimal entry timing (hour of day)
 4. Optimal exit parameters (SL/TP)
 5. Which signals to filter out
+6. Which wallets to stop tracking (poor performers)
 
 The goal: Evolve from ~43% WR to 55%+ WR by learning what works.
 
@@ -25,6 +26,17 @@ from collections import defaultdict
 from dataclasses import dataclass, field, asdict
 from contextlib import contextmanager
 import os
+
+# Import wallet performance analyzer
+try:
+    from core.wallet_performance import WalletPerformanceAnalyzer
+    WALLET_ANALYZER_AVAILABLE = True
+except ImportError:
+    try:
+        from wallet_performance import WalletPerformanceAnalyzer
+        WALLET_ANALYZER_AVAILABLE = True
+    except ImportError:
+        WALLET_ANALYZER_AVAILABLE = False
 
 
 @dataclass
@@ -64,12 +76,24 @@ class StrategyLearner:
     1. Analyze what's working
     2. Update filters
     3. Track improvement
+    4. Remove poor performing wallets
     """
     
-    def __init__(self, db_path: str = "robust_paper_trades_v6.db"):
+    def __init__(self, db_path: str = "robust_paper_trades_v6.db", main_db_path: str = "swing_traders.db"):
         self.db_path = db_path
+        self.main_db_path = main_db_path
         self.config_path = "strategy_config.json"
         self.config = self._load_config()
+        
+        # Initialize wallet performance analyzer
+        if WALLET_ANALYZER_AVAILABLE:
+            self.wallet_analyzer = WalletPerformanceAnalyzer(
+                paper_db_path=db_path,
+                main_db_path=main_db_path
+            )
+        else:
+            self.wallet_analyzer = None
+            print("  ⚠️ Wallet analyzer not available")
         
         print(f"📚 Strategy Learner initialized")
         print(f"   Phase: {self.config.phase}")
@@ -181,6 +205,12 @@ class StrategyLearner:
         self._generate_recommendations(results)
         self._apply_recommendations(results)
         
+        # 8. Wallet cleanup - identify poor performers
+        if self.wallet_analyzer:
+            print("\n  🧹 Analyzing wallet performance...")
+            wallet_cleanup = self._analyze_wallet_performance()
+            results['wallet_cleanup'] = wallet_cleanup
+        
         # Save updated config
         self.config.current_wr = overall['win_rate']
         self._save_config()
@@ -190,6 +220,47 @@ class StrategyLearner:
         
         results['status'] = 'completed'
         return results
+    
+    def _analyze_wallet_performance(self) -> Dict:
+        """Analyze and report on wallet performance"""
+        if not self.wallet_analyzer:
+            return {'status': 'analyzer_not_available'}
+        
+        to_remove = self.wallet_analyzer.get_wallets_to_remove(days=14)
+        top = self.wallet_analyzer.get_top_performers(days=14, min_trades=5)[:5]
+        
+        result = {
+            'wallets_to_remove': len(to_remove),
+            'remove_list': [p.to_dict() for p in to_remove[:10]],
+            'top_performers': [p.to_dict() for p in top]
+        }
+        
+        if to_remove:
+            print(f"     ❌ {len(to_remove)} wallets flagged for removal")
+            for perf in to_remove[:3]:
+                print(f"        {perf.address[:12]}... | {perf.win_rate:.0%} WR | {perf.total_pnl_sol:+.4f} SOL")
+        
+        if top:
+            print(f"     🏆 Top performers:")
+            for perf in top[:3]:
+                print(f"        {perf.address[:12]}... | {perf.win_rate:.0%} WR | {perf.total_pnl_sol:+.4f} SOL")
+        
+        return result
+    
+    def run_wallet_cleanup(self, webhook_manager=None, db=None, dry_run: bool = True) -> Dict:
+        """
+        Run wallet cleanup to remove poor performers.
+        
+        Should be called periodically (e.g., daily) with dry_run=False to actually remove wallets.
+        """
+        if not self.wallet_analyzer:
+            return {'status': 'analyzer_not_available'}
+        
+        return self.wallet_analyzer.run_cleanup(
+            webhook_manager=webhook_manager,
+            db=db,
+            dry_run=dry_run
+        )
     
     def _analyze_overall(self, trades: List[Dict]) -> Dict:
         """Calculate overall performance metrics"""

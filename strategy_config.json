@@ -8,10 +8,10 @@
   "take_profit_pct": 30.0,
   "trailing_stop_pct": 10.0,
   "max_hold_hours": 12,
-  "iteration": 1,
+  "iteration": 2,
   "phase": "exploration",
-  "last_updated": "2026-01-27T01:19:43.132511",
+  "last_updated": "2026-01-27T07:22:10.726249",
   "baseline_wr": 0.0,
-  "current_wr": 0.3810240963855422,
+  "current_wr": 0.37256135934550033,
   "target_wr": 0.55
 }

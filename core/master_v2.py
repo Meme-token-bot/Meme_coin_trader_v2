@@ -934,6 +934,66 @@ def learning_status():
         'last_updated': learner.config.last_updated
     })
 
+
+@app.route('/wallets/performance', methods=['GET'])
+def wallet_performance():
+    """Get wallet performance analysis"""
+    global trading_system
+    if not trading_system or not trading_system.paper_engine:
+        return jsonify({'error': 'Paper trading not enabled'}), 503
+    
+    learner = trading_system.paper_engine.strategy_learner
+    
+    if not learner.wallet_analyzer:
+        return jsonify({'error': 'Wallet analyzer not available'}), 503
+    
+    days = request.args.get('days', 14, type=int)
+    performances = learner.wallet_analyzer.analyze_all_wallets(days)
+    
+    # Convert to list sorted by trade count
+    perf_list = sorted(
+        [p.to_dict() for p in performances.values()],
+        key=lambda x: x['total_trades'],
+        reverse=True
+    )
+    
+    return jsonify({
+        'wallets_analyzed': len(perf_list),
+        'performances': perf_list[:50]  # Top 50
+    })
+
+
+@app.route('/wallets/cleanup', methods=['POST'])
+def wallet_cleanup():
+    """Run wallet cleanup to remove poor performers"""
+    global trading_system
+    if not trading_system or not trading_system.paper_engine:
+        return jsonify({'error': 'Paper trading not enabled'}), 503
+    
+    learner = trading_system.paper_engine.strategy_learner
+    
+    if not learner.wallet_analyzer:
+        return jsonify({'error': 'Wallet analyzer not available'}), 503
+    
+    # Check for confirmation
+    dry_run = request.args.get('confirm', '') != 'YES'
+    
+    if dry_run:
+        result = learner.run_wallet_cleanup(
+            webhook_manager=trading_system.webhook_manager,
+            db=trading_system.db,
+            dry_run=True
+        )
+        result['note'] = 'Dry run - add ?confirm=YES to actually remove wallets'
+    else:
+        result = learner.run_wallet_cleanup(
+            webhook_manager=trading_system.webhook_manager,
+            db=trading_system.db,
+            dry_run=False
+        )
+    
+    return jsonify(result)
+
 @app.route('/test', methods=['GET'])
 def test():
     return jsonify({
@@ -994,15 +1054,34 @@ def background_tasks():
                     print(f"\n🔍 Running discovery...")
                     trading_system.run_discovery()
             
-            # Learning
+            # Learning (every 6 hours)
             if trading_system.paper_engine:
                 if (now - last_learning).total_seconds() >= 6 * 3600:
                     last_learning = now
-                    print(f"\n🧪 Running learning...")
-                    trading_system.paper_engine.run_learning(
+                    print(f"\n🧠 Running learning iteration...")
+                    learning_result = trading_system.paper_engine.run_learning(
                         force=True, 
                         notifier=trading_system.notifier
                     )
+                    
+                    # After learning, run wallet cleanup (actually remove poor performers)
+                    if learning_result.get('status') == 'completed':
+                        learner = trading_system.paper_engine.strategy_learner
+                        if learner.wallet_analyzer:
+                            to_remove = learner.wallet_analyzer.get_wallets_to_remove(days=14)
+                            if to_remove:
+                                print(f"\n🧹 Removing {len(to_remove)} poor performing wallets...")
+                                cleanup_result = learner.run_wallet_cleanup(
+                                    webhook_manager=trading_system.webhook_manager,
+                                    db=trading_system.db,
+                                    dry_run=False  # Actually remove!
+                                )
+                                if trading_system.notifier:
+                                    removed_count = len(cleanup_result.get('wallets_removed', []))
+                                    if removed_count > 0:
+                                        trading_system.notifier.send(
+                                            f"🧹 Removed {removed_count} poor performing wallets"
+                                        )
         
         except Exception as e:
             print(f"Background task error: {e}")
