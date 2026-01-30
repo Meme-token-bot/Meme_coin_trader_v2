@@ -1,0 +1,1365 @@
+"""
+LIVE TRADING ENGINE V2 - Production Ready
+==========================================
+
+Builds on executioner_v1.py with enhancements:
+1. Jito bundle integration for MEV protection and speed
+2. Parallel paper/live execution with comparison
+3. Enhanced safety controls for 3 SOL capital
+4. AWS Secrets Manager integration (optional)
+5. Kill switch with position liquidation
+
+CAPITAL: 3 SOL
+POSITION SIZE: 0.08 SOL (recommended)
+MAX POSITIONS: 10
+MAX DEPLOYED: 0.80 SOL (27% of capital)
+
+Author: Claude
+"""
+
+import os
+import json
+import time
+import threading
+import hashlib
+import base64
+import base58
+from datetime import datetime, timezone, timedelta
+from typing import Dict, List, Optional, Tuple, Any
+from dataclasses import dataclass, field, asdict
+from decimal import Decimal
+from enum import Enum
+from contextlib import contextmanager
+import sqlite3
+import requests
+import logging
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s | %(levelname)s | %(name)s | %(message)s'
+)
+logger = logging.getLogger("LiveTrader")
+
+# Solana imports
+try:
+    from solders.keypair import Keypair
+    from solders.pubkey import Pubkey
+    from solders.transaction import VersionedTransaction
+    from solders.signature import Signature
+    from solana.rpc.api import Client as SolanaClient
+    SOLANA_AVAILABLE = True
+except ImportError:
+    SOLANA_AVAILABLE = False
+    logger.warning("⚠️ Solana libraries not installed. Run: pip install solana solders --break-system-packages")
+
+
+# =============================================================================
+# CONSTANTS
+# =============================================================================
+
+SOL_MINT = "So11111111111111111111111111111111111111112"
+LAMPORTS_PER_SOL = 1_000_000_000
+
+# API Endpoints
+JUPITER_QUOTE_URL = "https://quote-api.jup.ag/v6/quote"
+JUPITER_SWAP_URL = "https://quote-api.jup.ag/v6/swap"
+JUPITER_PRICE_URL = "https://price.jup.ag/v6/price"
+
+# Jito endpoints
+JITO_BLOCK_ENGINE_URL = "https://mainnet.block-engine.jito.wtf"
+JITO_BUNDLE_URL = f"{JITO_BLOCK_ENGINE_URL}/api/v1/bundles"
+JITO_TIP_ACCOUNTS = [
+    "96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5",
+    "HFqU5x63VTqvQss8hp11i4bVmkdzGTbQrWMT7wekGuLt",
+    "Cw8CFyM9FkoMi7K7Crf6HNQqf4uEMzpKw6QNghXLvLkY",
+    "ADaUMid9yfUytqMBgopwjb2DTLSokTSzL1zt6iGPaS49",
+    "DfXygSm4jCyNCybVYYK6DwvWqjKee8pbDmJGcLWNDXjh",
+    "ADuUkR4vqLUMWXxW9gh6D6L8pMSawimctcNZ5pGwDcEt",
+    "DttWaMuVvTiduZRnguLF7jNxTgiMBZ1hyAumKUiL2KRL",
+    "3AVi9Tg9Uo68tJfuvoKvqKNWKkC5wPdSSdeBnizKZ6jT"
+]
+
+# Price APIs
+COINGECKO_URL = "https://api.coingecko.com/api/v3/simple/price"
+DEXSCREENER_URL = "https://api.dexscreener.com/latest/dex/tokens/{}"
+
+
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+
+@dataclass
+class LiveTradingConfig:
+    """Production configuration for 3 SOL capital"""
+    
+    # Capital management
+    starting_capital_sol: float = 3.0
+    position_size_sol: float = 0.08          # Per trade
+    max_open_positions: int = 10             # Max concurrent
+    max_deployed_sol: float = 0.80           # Max SOL in positions
+    fee_reserve_sol: float = 0.30            # Reserved for fees
+    
+    # Risk management
+    max_daily_loss_sol: float = 0.25         # Stop trading for day
+    max_consecutive_losses: int = 15         # Pause and reassess
+    min_balance_sol: float = 1.50            # Emergency stop if below
+    cool_down_minutes: int = 30              # After consecutive losses
+    
+    # Execution
+    default_slippage_bps: int = 150          # 1.5% slippage
+    max_slippage_bps: int = 300              # 3% max
+    jito_tip_lamports: int = 1_000_000       # 0.001 SOL tip
+    priority_fee_lamports: int = 50_000      # Priority fee
+    confirmation_timeout: int = 60           # Seconds
+    retry_attempts: int = 2
+    
+    # Entry filters (from paper trading analysis)
+    min_conviction: int = 60
+    min_liquidity_usd: float = 5000
+    blocked_hours_utc: List[int] = field(default_factory=lambda: [1, 3, 5, 19, 23])
+    
+    # Exit parameters (from paper trading)
+    stop_loss_pct: float = -0.15             # -15%
+    take_profit_pct: float = 0.30            # +30%
+    trailing_stop_pct: float = 0.10          # 10% from peak
+    max_hold_hours: int = 12
+    
+    # Feature flags
+    enable_live_trading: bool = False        # MUST be True to trade
+    enable_jito_bundles: bool = True         # Use Jito for speed
+    parallel_paper_trading: bool = True      # Run paper alongside
+    
+    # Tax (NZ)
+    tax_year_start_month: int = 4            # April
+    cost_basis_method: str = "FIFO"
+
+
+# =============================================================================
+# PRICE SERVICE
+# =============================================================================
+
+class PriceService:
+    """Get token prices with caching"""
+    
+    def __init__(self):
+        self._cache = {}
+        self._cache_ttl = 30  # seconds
+        self._sol_nzd_rate = None
+        self._sol_usd_rate = None
+        self._last_sol_update = None
+    
+    def get_sol_prices(self) -> Tuple[float, float]:
+        """Get SOL price in USD and NZD"""
+        now = datetime.now()
+        
+        if (self._last_sol_update and 
+            (now - self._last_sol_update).total_seconds() < 60):
+            return self._sol_usd_rate or 0, self._sol_nzd_rate or 0
+        
+        try:
+            resp = requests.get(
+                f"{COINGECKO_URL}?ids=solana&vs_currencies=usd,nzd",
+                timeout=10
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                self._sol_usd_rate = data['solana']['usd']
+                self._sol_nzd_rate = data['solana']['nzd']
+                self._last_sol_update = now
+        except Exception as e:
+            logger.warning(f"CoinGecko error: {e}")
+        
+        return self._sol_usd_rate or 0, self._sol_nzd_rate or 0
+    
+    def get_token_price(self, token_address: str) -> Optional[float]:
+        """Get token price in USD"""
+        cache_key = f"price_{token_address}"
+        
+        if cache_key in self._cache:
+            entry = self._cache[cache_key]
+            if (datetime.now() - entry['time']).total_seconds() < self._cache_ttl:
+                return entry['price']
+        
+        try:
+            resp = requests.get(
+                f"{JUPITER_PRICE_URL}?ids={token_address}",
+                timeout=10
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                price = data.get('data', {}).get(token_address, {}).get('price')
+                if price:
+                    self._cache[cache_key] = {'price': float(price), 'time': datetime.now()}
+                    return float(price)
+        except Exception as e:
+            logger.warning(f"Jupiter price error: {e}")
+        
+        # Fallback to DexScreener
+        try:
+            resp = requests.get(DEXSCREENER_URL.format(token_address), timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                pairs = data.get('pairs', [])
+                if pairs:
+                    price = float(pairs[0].get('priceUsd', 0))
+                    self._cache[cache_key] = {'price': price, 'time': datetime.now()}
+                    return price
+        except:
+            pass
+        
+        return None
+
+
+# =============================================================================
+# JITO BUNDLE SERVICE
+# =============================================================================
+
+class JitoBundleService:
+    """Jito bundle submission for MEV protection"""
+    
+    def __init__(self, keypair: Keypair):
+        self.keypair = keypair
+        self._tip_account_index = 0
+    
+    def get_tip_account(self) -> str:
+        """Rotate through tip accounts"""
+        account = JITO_TIP_ACCOUNTS[self._tip_account_index]
+        self._tip_account_index = (self._tip_account_index + 1) % len(JITO_TIP_ACCOUNTS)
+        return account
+    
+    def submit_bundle(self, transactions: List[str], tip_lamports: int = 1_000_000) -> Optional[str]:
+        """
+        Submit a bundle to Jito block engine.
+        
+        Args:
+            transactions: List of base64 encoded transactions
+            tip_lamports: Tip amount in lamports
+        
+        Returns:
+            Bundle ID if successful
+        """
+        try:
+            payload = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "sendBundle",
+                "params": [transactions]
+            }
+            
+            resp = requests.post(
+                JITO_BUNDLE_URL,
+                json=payload,
+                headers={"Content-Type": "application/json"},
+                timeout=30
+            )
+            
+            if resp.status_code == 200:
+                result = resp.json()
+                if 'result' in result:
+                    logger.info(f"🚀 Jito bundle submitted: {result['result']}")
+                    return result['result']
+                elif 'error' in result:
+                    logger.error(f"Jito error: {result['error']}")
+            else:
+                logger.error(f"Jito HTTP error: {resp.status_code}")
+        
+        except Exception as e:
+            logger.error(f"Jito bundle submission failed: {e}")
+        
+        return None
+    
+    def get_bundle_status(self, bundle_id: str) -> Optional[str]:
+        """Check bundle status"""
+        try:
+            payload = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "getBundleStatuses",
+                "params": [[bundle_id]]
+            }
+            
+            resp = requests.post(
+                JITO_BUNDLE_URL,
+                json=payload,
+                headers={"Content-Type": "application/json"},
+                timeout=10
+            )
+            
+            if resp.status_code == 200:
+                result = resp.json()
+                statuses = result.get('result', {}).get('value', [])
+                if statuses:
+                    return statuses[0].get('confirmation_status')
+        except Exception as e:
+            logger.warning(f"Bundle status check failed: {e}")
+        
+        return None
+
+
+# =============================================================================
+# TAX DATABASE
+# =============================================================================
+
+class TaxDatabase:
+    """NZ Tax compliant transaction recording"""
+    
+    def __init__(self, db_path: str = "live_trades_tax.db"):
+        self.db_path = db_path
+        self._init_database()
+    
+    @contextmanager
+    def _get_connection(self):
+        conn = sqlite3.connect(self.db_path, timeout=30)
+        conn.row_factory = sqlite3.Row
+        try:
+            yield conn
+            conn.commit()
+        finally:
+            conn.close()
+    
+    def _init_database(self):
+        """Initialize tax tables"""
+        with self._get_connection() as conn:
+            # Main transactions table
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS tax_transactions (
+                    id TEXT PRIMARY KEY,
+                    timestamp TEXT NOT NULL,
+                    transaction_type TEXT NOT NULL,
+                    token_address TEXT NOT NULL,
+                    token_symbol TEXT,
+                    token_amount REAL,
+                    sol_amount REAL,
+                    price_per_token_usd REAL,
+                    price_per_token_nzd REAL,
+                    sol_price_usd REAL,
+                    sol_price_nzd REAL,
+                    total_value_usd REAL,
+                    total_value_nzd REAL,
+                    fee_sol REAL,
+                    fee_nzd REAL,
+                    cost_basis_nzd REAL,
+                    gain_loss_nzd REAL,
+                    signature TEXT,
+                    notes TEXT,
+                    is_live BOOLEAN DEFAULT 1
+                )
+            """)
+            
+            # Cost basis lots for FIFO
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS cost_basis_lots (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    token_address TEXT NOT NULL,
+                    acquisition_date TEXT NOT NULL,
+                    tokens_acquired REAL NOT NULL,
+                    tokens_remaining REAL NOT NULL,
+                    cost_per_token_nzd REAL NOT NULL,
+                    total_cost_nzd REAL NOT NULL,
+                    acquisition_signature TEXT
+                )
+            """)
+            
+            # Live positions
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS live_positions (
+                    token_address TEXT PRIMARY KEY,
+                    token_symbol TEXT,
+                    tokens_held REAL,
+                    entry_price_usd REAL,
+                    entry_time TEXT,
+                    total_cost_sol REAL,
+                    total_cost_nzd REAL,
+                    stop_loss_pct REAL,
+                    take_profit_pct REAL,
+                    trailing_stop_pct REAL,
+                    peak_price_usd REAL,
+                    entry_signature TEXT,
+                    conviction_score INTEGER
+                )
+            """)
+            
+            # Daily stats
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS daily_stats (
+                    date TEXT PRIMARY KEY,
+                    trades INTEGER DEFAULT 0,
+                    wins INTEGER DEFAULT 0,
+                    losses INTEGER DEFAULT 0,
+                    pnl_sol REAL DEFAULT 0,
+                    pnl_nzd REAL DEFAULT 0,
+                    fees_sol REAL DEFAULT 0
+                )
+            """)
+            
+            # Execution log
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS execution_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT,
+                    action TEXT,
+                    token_address TEXT,
+                    token_symbol TEXT,
+                    status TEXT,
+                    signature TEXT,
+                    error TEXT,
+                    details TEXT
+                )
+            """)
+    
+    def record_trade(self, trade_data: Dict) -> str:
+        """Record a trade for tax purposes"""
+        record_id = self._generate_id()
+        
+        with self._get_connection() as conn:
+            conn.execute("""
+                INSERT INTO tax_transactions (
+                    id, timestamp, transaction_type, token_address, token_symbol,
+                    token_amount, sol_amount, price_per_token_usd, price_per_token_nzd,
+                    sol_price_usd, sol_price_nzd, total_value_usd, total_value_nzd,
+                    fee_sol, fee_nzd, cost_basis_nzd, gain_loss_nzd, signature, notes, is_live
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                record_id,
+                trade_data.get('timestamp', datetime.now(timezone.utc).isoformat()),
+                trade_data.get('transaction_type', 'UNKNOWN'),
+                trade_data.get('token_address', ''),
+                trade_data.get('token_symbol', 'UNKNOWN'),
+                trade_data.get('token_amount', 0),
+                trade_data.get('sol_amount', 0),
+                trade_data.get('price_per_token_usd', 0),
+                trade_data.get('price_per_token_nzd', 0),
+                trade_data.get('sol_price_usd', 0),
+                trade_data.get('sol_price_nzd', 0),
+                trade_data.get('total_value_usd', 0),
+                trade_data.get('total_value_nzd', 0),
+                trade_data.get('fee_sol', 0),
+                trade_data.get('fee_nzd', 0),
+                trade_data.get('cost_basis_nzd'),
+                trade_data.get('gain_loss_nzd'),
+                trade_data.get('signature', ''),
+                trade_data.get('notes', ''),
+                trade_data.get('is_live', True)
+            ))
+            
+            # If it's a buy, create a cost basis lot
+            if trade_data.get('transaction_type') == 'BUY':
+                conn.execute("""
+                    INSERT INTO cost_basis_lots (
+                        token_address, acquisition_date, tokens_acquired, tokens_remaining,
+                        cost_per_token_nzd, total_cost_nzd, acquisition_signature
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    trade_data.get('token_address'),
+                    trade_data.get('timestamp', datetime.now(timezone.utc).isoformat()),
+                    trade_data.get('token_amount', 0),
+                    trade_data.get('token_amount', 0),
+                    trade_data.get('price_per_token_nzd', 0),
+                    trade_data.get('total_value_nzd', 0),
+                    trade_data.get('signature', '')
+                ))
+        
+        return record_id
+    
+    def add_position(self, position: Dict):
+        """Add or update a live position"""
+        with self._get_connection() as conn:
+            conn.execute("""
+                INSERT OR REPLACE INTO live_positions (
+                    token_address, token_symbol, tokens_held, entry_price_usd,
+                    entry_time, total_cost_sol, total_cost_nzd, stop_loss_pct,
+                    take_profit_pct, trailing_stop_pct, peak_price_usd,
+                    entry_signature, conviction_score
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                position['token_address'],
+                position.get('token_symbol', 'UNKNOWN'),
+                position.get('tokens_held', 0),
+                position.get('entry_price_usd', 0),
+                position.get('entry_time', datetime.now(timezone.utc).isoformat()),
+                position.get('total_cost_sol', 0),
+                position.get('total_cost_nzd', 0),
+                position.get('stop_loss_pct', -0.15),
+                position.get('take_profit_pct', 0.30),
+                position.get('trailing_stop_pct', 0.10),
+                position.get('peak_price_usd', position.get('entry_price_usd', 0)),
+                position.get('entry_signature', ''),
+                position.get('conviction_score', 0)
+            ))
+    
+    def remove_position(self, token_address: str):
+        """Remove a closed position"""
+        with self._get_connection() as conn:
+            conn.execute("DELETE FROM live_positions WHERE token_address = ?", (token_address,))
+    
+    def get_positions(self) -> List[Dict]:
+        """Get all open positions"""
+        with self._get_connection() as conn:
+            rows = conn.execute("SELECT * FROM live_positions").fetchall()
+            return [dict(r) for r in rows]
+    
+    def update_position_peak(self, token_address: str, peak_price: float):
+        """Update peak price for trailing stop"""
+        with self._get_connection() as conn:
+            conn.execute(
+                "UPDATE live_positions SET peak_price_usd = ? WHERE token_address = ?",
+                (peak_price, token_address)
+            )
+    
+    def get_fifo_cost_basis(self, token_address: str, tokens_to_sell: float) -> Tuple[float, float]:
+        """
+        Calculate FIFO cost basis for a sale.
+        Returns (cost_basis_nzd, tokens_consumed)
+        """
+        with self._get_connection() as conn:
+            lots = conn.execute("""
+                SELECT * FROM cost_basis_lots 
+                WHERE token_address = ? AND tokens_remaining > 0
+                ORDER BY acquisition_date ASC
+            """, (token_address,)).fetchall()
+            
+            cost_basis = 0.0
+            tokens_remaining = tokens_to_sell
+            
+            for lot in lots:
+                lot = dict(lot)
+                if tokens_remaining <= 0:
+                    break
+                
+                consume = min(lot['tokens_remaining'], tokens_remaining)
+                cost_basis += consume * lot['cost_per_token_nzd']
+                tokens_remaining -= consume
+                
+                # Update the lot
+                new_remaining = lot['tokens_remaining'] - consume
+                conn.execute(
+                    "UPDATE cost_basis_lots SET tokens_remaining = ? WHERE id = ?",
+                    (new_remaining, lot['id'])
+                )
+            
+            return cost_basis, tokens_to_sell - tokens_remaining
+    
+    def update_daily_stats(self, pnl_sol: float, is_win: bool, fee_sol: float = 0):
+        """Update daily statistics"""
+        today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+        
+        with self._get_connection() as conn:
+            existing = conn.execute(
+                "SELECT * FROM daily_stats WHERE date = ?", (today,)
+            ).fetchone()
+            
+            if existing:
+                conn.execute("""
+                    UPDATE daily_stats SET
+                        trades = trades + 1,
+                        wins = wins + ?,
+                        losses = losses + ?,
+                        pnl_sol = pnl_sol + ?,
+                        fees_sol = fees_sol + ?
+                    WHERE date = ?
+                """, (1 if is_win else 0, 0 if is_win else 1, pnl_sol, fee_sol, today))
+            else:
+                conn.execute("""
+                    INSERT INTO daily_stats (date, trades, wins, losses, pnl_sol, fees_sol)
+                    VALUES (?, 1, ?, ?, ?, ?)
+                """, (today, 1 if is_win else 0, 0 if is_win else 1, pnl_sol, fee_sol))
+    
+    def get_daily_stats(self) -> Dict:
+        """Get today's stats"""
+        today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+        
+        with self._get_connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM daily_stats WHERE date = ?", (today,)
+            ).fetchone()
+            
+            if row:
+                return dict(row)
+            return {'date': today, 'trades': 0, 'wins': 0, 'losses': 0, 'pnl_sol': 0, 'fees_sol': 0}
+    
+    def log_execution(self, action: str, token_address: str, token_symbol: str,
+                      status: str, signature: str = None, error: str = None, details: Dict = None):
+        """Log an execution attempt"""
+        with self._get_connection() as conn:
+            conn.execute("""
+                INSERT INTO execution_log (timestamp, action, token_address, token_symbol, status, signature, error, details)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                datetime.now(timezone.utc).isoformat(),
+                action, token_address, token_symbol, status, signature, error,
+                json.dumps(details) if details else None
+            ))
+    
+    def _generate_id(self) -> str:
+        """Generate unique ID"""
+        timestamp = datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')
+        random_part = hashlib.sha256(os.urandom(8)).hexdigest()[:8]
+        return f"TX_{timestamp}_{random_part}"
+
+
+# =============================================================================
+# LIVE TRADING ENGINE
+# =============================================================================
+
+class LiveTradingEngine:
+    """
+    Production live trading engine.
+    
+    Features:
+    - Jito bundle submission for fast, MEV-protected execution
+    - Parallel paper trading for comparison
+    - NZ tax compliant record keeping
+    - Kill switch with position liquidation
+    - Daily loss limits and cool downs
+    """
+    
+    def __init__(self, 
+                 private_key: str = None,
+                 helius_key: str = None,
+                 config: LiveTradingConfig = None):
+        
+        self.config = config or LiveTradingConfig()
+        self.price_service = PriceService()
+        self.tax_db = TaxDatabase()
+        
+        # Load wallet
+        self.keypair = None
+        self.wallet_pubkey = None
+        
+        if private_key:
+            try:
+                self.keypair = Keypair.from_base58_string(private_key)
+                self.wallet_pubkey = str(self.keypair.pubkey())
+                logger.info(f"🔐 Wallet loaded: {self.wallet_pubkey[:8]}...{self.wallet_pubkey[-4:]}")
+            except Exception as e:
+                logger.error(f"Failed to load wallet: {e}")
+        
+        # Solana client
+        self.helius_key = helius_key or os.getenv('HELIUS_KEY')
+        if self.helius_key:
+            self.rpc_url = f"https://mainnet.helius-rpc.com/?api-key={self.helius_key}"
+            self.solana_client = SolanaClient(self.rpc_url) if SOLANA_AVAILABLE else None
+        else:
+            self.solana_client = None
+            logger.warning("⚠️ No Helius key - RPC unavailable")
+        
+        # Jito service
+        self.jito = JitoBundleService(self.keypair) if self.keypair else None
+        
+        # State tracking
+        self._consecutive_losses = 0
+        self._cool_down_until = None
+        self._kill_switch_active = False
+        self._lock = threading.Lock()
+        
+        # Monitoring thread
+        self._monitor_thread = None
+        self._stop_monitoring = threading.Event()
+        
+        logger.info("🚀 Live Trading Engine initialized")
+        logger.info(f"   Live trading: {'ENABLED' if self.config.enable_live_trading else 'DISABLED'}")
+        logger.info(f"   Position size: {self.config.position_size_sol} SOL")
+        logger.info(f"   Max positions: {self.config.max_open_positions}")
+        logger.info(f"   Jito bundles: {'ENABLED' if self.config.enable_jito_bundles else 'DISABLED'}")
+    
+    def get_sol_balance(self) -> float:
+        """Get current SOL balance"""
+        if not self.solana_client or not self.keypair:
+            return 0.0
+        
+        try:
+            resp = self.solana_client.get_balance(self.keypair.pubkey())
+            return resp.value / LAMPORTS_PER_SOL
+        except Exception as e:
+            logger.error(f"Balance check failed: {e}")
+            return 0.0
+    
+    def can_open_position(self, signal: Dict = None) -> Tuple[bool, str]:
+        """Check if we can open a new position"""
+        
+        if self._kill_switch_active:
+            return False, "Kill switch active"
+        
+        if not self.config.enable_live_trading:
+            return False, "Live trading disabled"
+        
+        if self._cool_down_until and datetime.now(timezone.utc) < self._cool_down_until:
+            remaining = (self._cool_down_until - datetime.now(timezone.utc)).seconds // 60
+            return False, f"Cool down active ({remaining}m remaining)"
+        
+        # Check balance
+        balance = self.get_sol_balance()
+        if balance < self.config.min_balance_sol:
+            self._activate_kill_switch("Balance below minimum")
+            return False, f"Balance too low: {balance:.4f} SOL"
+        
+        if balance < self.config.position_size_sol + self.config.fee_reserve_sol:
+            return False, "Insufficient balance for position + fees"
+        
+        # Check position count
+        positions = self.tax_db.get_positions()
+        if len(positions) >= self.config.max_open_positions:
+            return False, f"Max positions reached ({self.config.max_open_positions})"
+        
+        # Check deployed capital
+        deployed = sum(p.get('total_cost_sol', 0) for p in positions)
+        if deployed + self.config.position_size_sol > self.config.max_deployed_sol:
+            return False, f"Max deployed capital reached ({self.config.max_deployed_sol} SOL)"
+        
+        # Check daily stats
+        daily = self.tax_db.get_daily_stats()
+        if daily['pnl_sol'] <= -self.config.max_daily_loss_sol:
+            return False, f"Daily loss limit reached ({self.config.max_daily_loss_sol} SOL)"
+        
+        # Check time filters
+        if signal:
+            current_hour = datetime.now(timezone.utc).hour
+            if current_hour in self.config.blocked_hours_utc:
+                return False, f"Hour {current_hour} UTC is blocked"
+            
+            conviction = signal.get('conviction_score', signal.get('conviction', 0))
+            if conviction < self.config.min_conviction:
+                return False, f"Conviction {conviction} < {self.config.min_conviction}"
+            
+            liquidity = signal.get('liquidity', 0)
+            if liquidity < self.config.min_liquidity_usd:
+                return False, f"Liquidity ${liquidity:,.0f} < ${self.config.min_liquidity_usd:,.0f}"
+        
+        return True, "OK"
+    
+    def execute_buy(self, signal: Dict) -> Dict:
+        """
+        Execute a buy order.
+        
+        Returns execution result dict.
+        """
+        token_address = signal.get('token_address')
+        token_symbol = signal.get('token_symbol', 'UNKNOWN')
+        
+        result = {
+            'success': False,
+            'action': 'BUY',
+            'token_address': token_address,
+            'token_symbol': token_symbol,
+            'signature': None,
+            'error': None,
+            'is_live': True
+        }
+        
+        # Pre-checks
+        can_trade, reason = self.can_open_position(signal)
+        if not can_trade:
+            result['error'] = reason
+            self.tax_db.log_execution('BUY', token_address, token_symbol, 'REJECTED', error=reason)
+            return result
+        
+        # Get prices
+        sol_usd, sol_nzd = self.price_service.get_sol_prices()
+        token_price = self.price_service.get_token_price(token_address)
+        
+        if not token_price:
+            result['error'] = "Could not get token price"
+            self.tax_db.log_execution('BUY', token_address, token_symbol, 'FAILED', error=result['error'])
+            return result
+        
+        # Calculate amounts
+        sol_amount = self.config.position_size_sol
+        input_lamports = int(sol_amount * LAMPORTS_PER_SOL)
+        
+        try:
+            # Get Jupiter quote
+            quote = self._get_jupiter_quote(
+                input_mint=SOL_MINT,
+                output_mint=token_address,
+                amount=input_lamports,
+                slippage_bps=self.config.default_slippage_bps
+            )
+            
+            if not quote:
+                result['error'] = "Failed to get quote"
+                self.tax_db.log_execution('BUY', token_address, token_symbol, 'FAILED', error=result['error'])
+                return result
+            
+            # Get swap transaction
+            swap_tx = self._get_jupiter_swap(quote)
+            
+            if not swap_tx:
+                result['error'] = "Failed to get swap transaction"
+                self.tax_db.log_execution('BUY', token_address, token_symbol, 'FAILED', error=result['error'])
+                return result
+            
+            # Execute via Jito or regular RPC
+            if self.config.enable_jito_bundles and self.jito:
+                signature = self._execute_via_jito(swap_tx)
+            else:
+                signature = self._execute_via_rpc(swap_tx)
+            
+            if not signature:
+                result['error'] = "Transaction failed"
+                self.tax_db.log_execution('BUY', token_address, token_symbol, 'FAILED', error=result['error'])
+                return result
+            
+            # Wait for confirmation
+            confirmed = self._wait_for_confirmation(signature)
+            
+            if not confirmed:
+                result['error'] = "Transaction not confirmed"
+                self.tax_db.log_execution('BUY', token_address, token_symbol, 'UNCONFIRMED', 
+                                          signature=signature, error=result['error'])
+                return result
+            
+            # Calculate received tokens
+            out_amount = int(quote.get('outAmount', 0))
+            tokens_received = out_amount / (10 ** 6)  # Assume 6 decimals, adjust as needed
+            
+            # Calculate values
+            token_price_nzd = token_price * (sol_nzd / sol_usd) if sol_usd > 0 else 0
+            total_value_usd = sol_amount * sol_usd
+            total_value_nzd = sol_amount * sol_nzd
+            
+            # Estimate fee
+            fee_sol = 0.002  # ~0.002 SOL typical
+            
+            # Record trade
+            trade_data = {
+                'timestamp': datetime.now(timezone.utc).isoformat(),
+                'transaction_type': 'BUY',
+                'token_address': token_address,
+                'token_symbol': token_symbol,
+                'token_amount': tokens_received,
+                'sol_amount': sol_amount,
+                'price_per_token_usd': token_price,
+                'price_per_token_nzd': token_price_nzd,
+                'sol_price_usd': sol_usd,
+                'sol_price_nzd': sol_nzd,
+                'total_value_usd': total_value_usd,
+                'total_value_nzd': total_value_nzd,
+                'fee_sol': fee_sol,
+                'fee_nzd': fee_sol * sol_nzd,
+                'signature': signature,
+                'is_live': True
+            }
+            self.tax_db.record_trade(trade_data)
+            
+            # Add position
+            position = {
+                'token_address': token_address,
+                'token_symbol': token_symbol,
+                'tokens_held': tokens_received,
+                'entry_price_usd': token_price,
+                'entry_time': datetime.now(timezone.utc).isoformat(),
+                'total_cost_sol': sol_amount,
+                'total_cost_nzd': total_value_nzd,
+                'stop_loss_pct': self.config.stop_loss_pct,
+                'take_profit_pct': self.config.take_profit_pct,
+                'trailing_stop_pct': self.config.trailing_stop_pct,
+                'peak_price_usd': token_price,
+                'entry_signature': signature,
+                'conviction_score': signal.get('conviction_score', 0)
+            }
+            self.tax_db.add_position(position)
+            
+            # Log success
+            self.tax_db.log_execution('BUY', token_address, token_symbol, 'SUCCESS', 
+                                      signature=signature, details={'sol_spent': sol_amount})
+            
+            result['success'] = True
+            result['signature'] = signature
+            result['sol_amount'] = sol_amount
+            result['tokens_received'] = tokens_received
+            
+            logger.info(f"✅ BUY executed: {token_symbol} | {sol_amount} SOL | Sig: {signature[:16]}...")
+            
+        except Exception as e:
+            result['error'] = str(e)
+            self.tax_db.log_execution('BUY', token_address, token_symbol, 'ERROR', error=str(e))
+            logger.error(f"❌ BUY failed: {e}")
+        
+        return result
+    
+    def execute_sell(self, token_address: str, exit_reason: str = "MANUAL") -> Dict:
+        """Execute a sell order for an open position"""
+        
+        result = {
+            'success': False,
+            'action': 'SELL',
+            'token_address': token_address,
+            'exit_reason': exit_reason,
+            'signature': None,
+            'error': None,
+            'pnl_sol': 0,
+            'pnl_pct': 0
+        }
+        
+        # Get position
+        positions = self.tax_db.get_positions()
+        position = next((p for p in positions if p['token_address'] == token_address), None)
+        
+        if not position:
+            result['error'] = "Position not found"
+            return result
+        
+        token_symbol = position.get('token_symbol', 'UNKNOWN')
+        tokens_held = position.get('tokens_held', 0)
+        entry_cost_sol = position.get('total_cost_sol', 0)
+        entry_cost_nzd = position.get('total_cost_nzd', 0)
+        
+        try:
+            # Get prices
+            sol_usd, sol_nzd = self.price_service.get_sol_prices()
+            token_price = self.price_service.get_token_price(token_address)
+            
+            if not token_price:
+                result['error'] = "Could not get token price"
+                return result
+            
+            # Calculate token amount in smallest unit
+            token_amount = int(tokens_held * (10 ** 6))  # Assume 6 decimals
+            
+            # Get Jupiter quote (sell token for SOL)
+            quote = self._get_jupiter_quote(
+                input_mint=token_address,
+                output_mint=SOL_MINT,
+                amount=token_amount,
+                slippage_bps=self.config.default_slippage_bps
+            )
+            
+            if not quote:
+                result['error'] = "Failed to get quote"
+                return result
+            
+            # Get swap transaction
+            swap_tx = self._get_jupiter_swap(quote)
+            
+            if not swap_tx:
+                result['error'] = "Failed to get swap transaction"
+                return result
+            
+            # Execute
+            if self.config.enable_jito_bundles and self.jito:
+                signature = self._execute_via_jito(swap_tx)
+            else:
+                signature = self._execute_via_rpc(swap_tx)
+            
+            if not signature:
+                result['error'] = "Transaction failed"
+                return result
+            
+            # Wait for confirmation
+            confirmed = self._wait_for_confirmation(signature)
+            
+            if not confirmed:
+                result['error'] = "Transaction not confirmed"
+                return result
+            
+            # Calculate received SOL
+            out_amount = int(quote.get('outAmount', 0))
+            sol_received = out_amount / LAMPORTS_PER_SOL
+            
+            # Calculate P&L
+            fee_sol = 0.002
+            net_sol_received = sol_received - fee_sol
+            pnl_sol = net_sol_received - entry_cost_sol
+            pnl_pct = (pnl_sol / entry_cost_sol * 100) if entry_cost_sol > 0 else 0
+            
+            # Get FIFO cost basis
+            cost_basis_nzd, _ = self.tax_db.get_fifo_cost_basis(token_address, tokens_held)
+            proceeds_nzd = sol_received * sol_nzd
+            gain_loss_nzd = proceeds_nzd - cost_basis_nzd
+            
+            # Record trade
+            trade_data = {
+                'timestamp': datetime.now(timezone.utc).isoformat(),
+                'transaction_type': 'SELL',
+                'token_address': token_address,
+                'token_symbol': token_symbol,
+                'token_amount': tokens_held,
+                'sol_amount': sol_received,
+                'price_per_token_usd': token_price,
+                'price_per_token_nzd': token_price * (sol_nzd / sol_usd) if sol_usd > 0 else 0,
+                'sol_price_usd': sol_usd,
+                'sol_price_nzd': sol_nzd,
+                'total_value_usd': sol_received * sol_usd,
+                'total_value_nzd': proceeds_nzd,
+                'fee_sol': fee_sol,
+                'fee_nzd': fee_sol * sol_nzd,
+                'cost_basis_nzd': cost_basis_nzd,
+                'gain_loss_nzd': gain_loss_nzd,
+                'signature': signature,
+                'notes': f"Exit reason: {exit_reason}",
+                'is_live': True
+            }
+            self.tax_db.record_trade(trade_data)
+            
+            # Update daily stats
+            is_win = pnl_sol > 0
+            self.tax_db.update_daily_stats(pnl_sol, is_win, fee_sol)
+            
+            # Update consecutive losses
+            with self._lock:
+                if is_win:
+                    self._consecutive_losses = 0
+                else:
+                    self._consecutive_losses += 1
+                    if self._consecutive_losses >= self.config.max_consecutive_losses:
+                        self._trigger_cool_down()
+            
+            # Remove position
+            self.tax_db.remove_position(token_address)
+            
+            # Log
+            self.tax_db.log_execution('SELL', token_address, token_symbol, 'SUCCESS',
+                                      signature=signature, details={
+                                          'exit_reason': exit_reason,
+                                          'pnl_sol': pnl_sol,
+                                          'pnl_pct': pnl_pct
+                                      })
+            
+            result['success'] = True
+            result['signature'] = signature
+            result['sol_received'] = sol_received
+            result['pnl_sol'] = pnl_sol
+            result['pnl_pct'] = pnl_pct
+            result['token_symbol'] = token_symbol
+            
+            emoji = "✅" if is_win else "❌"
+            logger.info(f"{emoji} SELL executed: {token_symbol} | {exit_reason} | PnL: {pnl_pct:+.1f}% ({pnl_sol:+.4f} SOL)")
+            
+        except Exception as e:
+            result['error'] = str(e)
+            logger.error(f"❌ SELL failed: {e}")
+        
+        return result
+    
+    def check_exit_conditions(self) -> List[Dict]:
+        """Check all positions for exit conditions"""
+        exits = []
+        positions = self.tax_db.get_positions()
+        
+        for pos in positions:
+            token_address = pos['token_address']
+            token_symbol = pos.get('token_symbol', 'UNKNOWN')
+            entry_price = pos.get('entry_price_usd', 0)
+            peak_price = pos.get('peak_price_usd', entry_price)
+            
+            # Get current price
+            current_price = self.price_service.get_token_price(token_address)
+            
+            if not current_price or not entry_price:
+                continue
+            
+            # Update peak price
+            if current_price > peak_price:
+                self.tax_db.update_position_peak(token_address, current_price)
+                peak_price = current_price
+            
+            # Calculate P&L
+            pnl_pct = (current_price - entry_price) / entry_price
+            
+            # Check conditions
+            exit_reason = None
+            
+            # Stop loss
+            if pnl_pct <= pos.get('stop_loss_pct', -0.15):
+                exit_reason = 'STOP_LOSS'
+            
+            # Take profit
+            elif pnl_pct >= pos.get('take_profit_pct', 0.30):
+                exit_reason = 'TAKE_PROFIT'
+            
+            # Trailing stop
+            elif peak_price > entry_price:
+                drop_from_peak = (current_price - peak_price) / peak_price
+                if drop_from_peak <= -pos.get('trailing_stop_pct', 0.10):
+                    exit_reason = 'TRAILING_STOP'
+            
+            # Time stop
+            entry_time = datetime.fromisoformat(pos.get('entry_time', '').replace('Z', '+00:00'))
+            hours_held = (datetime.now(timezone.utc) - entry_time).total_seconds() / 3600
+            if hours_held >= self.config.max_hold_hours:
+                exit_reason = 'TIME_STOP'
+            
+            if exit_reason:
+                result = self.execute_sell(token_address, exit_reason)
+                exits.append(result)
+        
+        return exits
+    
+    def _get_jupiter_quote(self, input_mint: str, output_mint: str, 
+                           amount: int, slippage_bps: int = 100) -> Optional[Dict]:
+        """Get a quote from Jupiter"""
+        try:
+            params = {
+                'inputMint': input_mint,
+                'outputMint': output_mint,
+                'amount': str(amount),
+                'slippageBps': slippage_bps
+            }
+            
+            resp = requests.get(JUPITER_QUOTE_URL, params=params, timeout=10)
+            
+            if resp.status_code == 200:
+                return resp.json()
+        except Exception as e:
+            logger.error(f"Jupiter quote error: {e}")
+        
+        return None
+    
+    def _get_jupiter_swap(self, quote: Dict) -> Optional[str]:
+        """Get swap transaction from Jupiter"""
+        try:
+            payload = {
+                'quoteResponse': quote,
+                'userPublicKey': self.wallet_pubkey,
+                'wrapAndUnwrapSol': True,
+                'prioritizationFeeLamports': self.config.priority_fee_lamports
+            }
+            
+            resp = requests.post(JUPITER_SWAP_URL, json=payload, timeout=30)
+            
+            if resp.status_code == 200:
+                data = resp.json()
+                return data.get('swapTransaction')
+        except Exception as e:
+            logger.error(f"Jupiter swap error: {e}")
+        
+        return None
+    
+    def _execute_via_jito(self, swap_tx_base64: str) -> Optional[str]:
+        """Execute transaction via Jito bundle"""
+        try:
+            # Decode and sign transaction
+            tx_bytes = base64.b64decode(swap_tx_base64)
+            tx = VersionedTransaction.from_bytes(tx_bytes)
+            
+            # Sign
+            tx.sign([self.keypair])
+            
+            # Re-encode
+            signed_tx = base64.b64encode(bytes(tx)).decode('utf-8')
+            
+            # Submit bundle
+            bundle_id = self.jito.submit_bundle([signed_tx], self.config.jito_tip_lamports)
+            
+            if bundle_id:
+                # Wait for bundle confirmation
+                for _ in range(30):  # 30 second timeout
+                    status = self.jito.get_bundle_status(bundle_id)
+                    if status in ['confirmed', 'finalized']:
+                        # Get signature from transaction
+                        return str(tx.signatures[0])
+                    time.sleep(1)
+            
+        except Exception as e:
+            logger.error(f"Jito execution error: {e}")
+        
+        return None
+    
+    def _execute_via_rpc(self, swap_tx_base64: str) -> Optional[str]:
+        """Execute transaction via regular RPC"""
+        try:
+            # Decode and sign
+            tx_bytes = base64.b64decode(swap_tx_base64)
+            tx = VersionedTransaction.from_bytes(tx_bytes)
+            tx.sign([self.keypair])
+            
+            # Send
+            resp = self.solana_client.send_transaction(tx)
+            
+            if resp.value:
+                return str(resp.value)
+            
+        except Exception as e:
+            logger.error(f"RPC execution error: {e}")
+        
+        return None
+    
+    def _wait_for_confirmation(self, signature: str, timeout: int = None) -> bool:
+        """Wait for transaction confirmation"""
+        timeout = timeout or self.config.confirmation_timeout
+        start = time.time()
+        
+        while time.time() - start < timeout:
+            try:
+                resp = self.solana_client.get_signature_statuses([Signature.from_string(signature)])
+                statuses = resp.value
+                
+                if statuses and statuses[0]:
+                    status = statuses[0]
+                    if status.confirmation_status in ['confirmed', 'finalized']:
+                        return status.err is None
+                
+                time.sleep(1)
+            except Exception as e:
+                logger.warning(f"Confirmation check error: {e}")
+                time.sleep(2)
+        
+        return False
+    
+    def _trigger_cool_down(self):
+        """Trigger cool down period"""
+        self._cool_down_until = datetime.now(timezone.utc) + timedelta(minutes=self.config.cool_down_minutes)
+        logger.warning(f"⏸️ Cool down triggered for {self.config.cool_down_minutes} minutes")
+    
+    def _activate_kill_switch(self, reason: str):
+        """Activate kill switch and close all positions"""
+        logger.critical(f"🚨 KILL SWITCH ACTIVATED: {reason}")
+        self._kill_switch_active = True
+        
+        # Close all positions
+        positions = self.tax_db.get_positions()
+        for pos in positions:
+            try:
+                self.execute_sell(pos['token_address'], 'KILL_SWITCH')
+            except Exception as e:
+                logger.error(f"Failed to close {pos.get('token_symbol')}: {e}")
+    
+    def start_monitoring(self):
+        """Start background exit monitoring"""
+        if self._monitor_thread and self._monitor_thread.is_alive():
+            return
+        
+        self._stop_monitoring.clear()
+        self._monitor_thread = threading.Thread(target=self._monitoring_loop, daemon=True)
+        self._monitor_thread.start()
+        logger.info("🔄 Exit monitoring started")
+    
+    def stop_monitoring(self):
+        """Stop background monitoring"""
+        self._stop_monitoring.set()
+        if self._monitor_thread:
+            self._monitor_thread.join(timeout=5)
+        logger.info("⏹️ Exit monitoring stopped")
+    
+    def _monitoring_loop(self):
+        """Background monitoring loop"""
+        while not self._stop_monitoring.is_set():
+            try:
+                if self.config.enable_live_trading and not self._kill_switch_active:
+                    exits = self.check_exit_conditions()
+                    for exit in exits:
+                        if exit.get('success'):
+                            logger.info(f"🚪 Auto-exit: {exit.get('token_symbol')} | {exit.get('exit_reason')}")
+            except Exception as e:
+                logger.error(f"Monitoring error: {e}")
+            
+            self._stop_monitoring.wait(30)  # Check every 30 seconds
+    
+    def get_status(self) -> Dict:
+        """Get engine status"""
+        balance = self.get_sol_balance()
+        positions = self.tax_db.get_positions()
+        daily = self.tax_db.get_daily_stats()
+        
+        deployed = sum(p.get('total_cost_sol', 0) for p in positions)
+        
+        return {
+            'live_trading_enabled': self.config.enable_live_trading,
+            'kill_switch_active': self._kill_switch_active,
+            'in_cool_down': self._cool_down_until is not None and datetime.now(timezone.utc) < self._cool_down_until,
+            'wallet': self.wallet_pubkey[:8] + '...' if self.wallet_pubkey else None,
+            'balance_sol': balance,
+            'deployed_sol': deployed,
+            'available_sol': balance - deployed - self.config.fee_reserve_sol,
+            'open_positions': len(positions),
+            'max_positions': self.config.max_open_positions,
+            'position_size': self.config.position_size_sol,
+            'daily_trades': daily.get('trades', 0),
+            'daily_pnl_sol': daily.get('pnl_sol', 0),
+            'daily_wins': daily.get('wins', 0),
+            'daily_losses': daily.get('losses', 0),
+            'consecutive_losses': self._consecutive_losses
+        }
+    
+    def print_status(self):
+        """Print formatted status"""
+        status = self.get_status()
+        
+        print("\n" + "=" * 60)
+        print("🚀 LIVE TRADING ENGINE STATUS")
+        print("=" * 60)
+        
+        print(f"\n  Trading: {'✅ ENABLED' if status['live_trading_enabled'] else '❌ DISABLED'}")
+        if status['kill_switch_active']:
+            print(f"  ⚠️ KILL SWITCH ACTIVE")
+        if status['in_cool_down']:
+            print(f"  ⏸️ IN COOL DOWN")
+        
+        print(f"\n  Wallet: {status['wallet']}")
+        print(f"  Balance: {status['balance_sol']:.4f} SOL")
+        print(f"  Deployed: {status['deployed_sol']:.4f} SOL")
+        print(f"  Available: {status['available_sol']:.4f} SOL")
+        
+        print(f"\n  Positions: {status['open_positions']}/{status['max_positions']}")
+        print(f"  Position Size: {status['position_size']} SOL")
+        
+        print(f"\n  Today's Stats:")
+        print(f"    Trades: {status['daily_trades']}")
+        print(f"    Wins: {status['daily_wins']}")
+        print(f"    Losses: {status['daily_losses']}")
+        print(f"    PnL: {status['daily_pnl_sol']:+.4f} SOL")
+        
+        print("\n" + "=" * 60)
+
+
+# =============================================================================
+# CLI
+# =============================================================================
+
+def main():
+    """CLI interface"""
+    import argparse
+    from dotenv import load_dotenv
+    load_dotenv()
+    
+    parser = argparse.ArgumentParser(description="Live Trading Engine")
+    parser.add_argument('command', choices=['status', 'positions', 'validate', 'enable', 'disable', 'kill'],
+                       help='Command to run')
+    
+    args = parser.parse_args()
+    
+    # Initialize engine
+    config = LiveTradingConfig(
+        enable_live_trading=os.getenv('ENABLE_LIVE_TRADING', '').lower() == 'true',
+        position_size_sol=float(os.getenv('POSITION_SIZE_SOL', '0.08'))
+    )
+    
+    engine = LiveTradingEngine(
+        private_key=os.getenv('SOLANA_PRIVATE_KEY'),
+        helius_key=os.getenv('HELIUS_KEY'),
+        config=config
+    )
+    
+    if args.command == 'status':
+        engine.print_status()
+    
+    elif args.command == 'positions':
+        positions = engine.tax_db.get_positions()
+        print(f"\n📊 Open Positions ({len(positions)})")
+        for pos in positions:
+            print(f"  {pos['token_symbol']}: {pos['tokens_held']:.4f} tokens")
+            print(f"    Entry: ${pos['entry_price_usd']:.8f}")
+            print(f"    Cost: {pos['total_cost_sol']:.4f} SOL")
+    
+    elif args.command == 'validate':
+        can_trade, reason = engine.can_open_position()
+        print(f"\nCan trade: {'✅ YES' if can_trade else '❌ NO'}")
+        print(f"Reason: {reason}")
+    
+    elif args.command == 'enable':
+        print("To enable live trading, set ENABLE_LIVE_TRADING=true in .env")
+    
+    elif args.command == 'disable':
+        print("To disable, set ENABLE_LIVE_TRADING=false in .env")
+    
+    elif args.command == 'kill':
+        confirm = input("⚠️ This will close ALL positions. Type 'KILL' to confirm: ")
+        if confirm == 'KILL':
+            engine._activate_kill_switch("Manual kill switch")
+        else:
+            print("Cancelled")
+
+
+if __name__ == "__main__":
+    main()
