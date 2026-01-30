@@ -1,0 +1,84 @@
+# =============================================================================
+# EXECUTIONER CONFIGURATION - Add these to your existing .env file
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# REQUIRED FOR LIVE TRADING
+# -----------------------------------------------------------------------------
+
+# Your Solana wallet private key (base58 encoded)
+# ⚠️ NEVER commit this to git or share it!
+# Get this from: Phantom > Settings > Export Private Key
+# Or generate with: solana-keygen new
+SOLANA_PRIVATE_KEY=your_base58_private_key_here
+
+# -----------------------------------------------------------------------------
+# LIVE TRADING CONTROLS
+# -----------------------------------------------------------------------------
+
+# Enable/disable live trading (default: false)
+# Set to 'true' only after paper trading validation
+ENABLE_LIVE_TRADING=false
+
+# Maximum position size in SOL (default: 0.25)
+# Start small and increase as confidence grows
+MAX_POSITION_SOL=0.25
+
+# Minimum conviction score to execute live (default: 60)
+# Higher = more selective, fewer trades
+MIN_CONVICTION=60
+
+# Percentage of signals to trade live (0-100, default: 0)
+# Use for gradual rollout: 0 → 10 → 25 → 50 → 100
+LIVE_TRADE_PCT=0
+
+# Default slippage tolerance in basis points (100 = 1%)
+DEFAULT_SLIPPAGE_BPS=100
+
+# Priority fee in lamports (helps with transaction speed)
+PRIORITY_FEE_LAMPORTS=100000
+
+# -----------------------------------------------------------------------------
+# SAFETY LIMITS
+# -----------------------------------------------------------------------------
+
+# Maximum daily loss before stopping (SOL)
+MAX_DAILY_LOSS_SOL=1.0
+
+# Maximum trades per day
+MAX_DAILY_TRADES=20
+
+# Cool down period after consecutive losses (minutes)
+COOL_DOWN_MINUTES=30
+
+# Number of consecutive losses before cool down
+CONSECUTIVE_LOSS_LIMIT=3
+
+# Maximum open positions at once
+MAX_OPEN_POSITIONS=10
+
+# Minimum liquidity required (USD)
+MIN_LIQUIDITY_USD=10000
+
+# -----------------------------------------------------------------------------
+# PAPER TRADING VALIDATION REQUIREMENTS
+# -----------------------------------------------------------------------------
+
+# Days of paper trading required before live
+MIN_PAPER_DAYS=14
+
+# Minimum paper trades before live
+MIN_PAPER_TRADES=50
+
+# Minimum paper trading win rate (0.55 = 55%)
+MIN_PAPER_WIN_RATE=0.55
+
+# -----------------------------------------------------------------------------
+# TAX DATABASE
+# -----------------------------------------------------------------------------
+
+# Path to tax records database (default: tax_records.db)
+TAX_DB_PATH=tax_records.db
+
+# Cost basis method: FIFO or WEIGHTED_AVERAGE (NZ typically uses FIFO)
+COST_BASIS_METHOD=FIFO

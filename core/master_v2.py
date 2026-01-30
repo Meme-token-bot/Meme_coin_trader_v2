@@ -980,14 +980,14 @@ def wallet_cleanup():
     
     if dry_run:
         result = learner.run_wallet_cleanup(
-            webhook_manager=trading_system.webhook_manager,
+            webhook_manager=trading_system.multi_webhook_manager,
             db=trading_system.db,
             dry_run=True
         )
         result['note'] = 'Dry run - add ?confirm=YES to actually remove wallets'
     else:
         result = learner.run_wallet_cleanup(
-            webhook_manager=trading_system.webhook_manager,
+            webhook_manager=trading_system.multi_webhook_manager,
             db=trading_system.db,
             dry_run=False
         )
@@ -1072,7 +1072,7 @@ def background_tasks():
                             if to_remove:
                                 print(f"\n🧹 Removing {len(to_remove)} poor performing wallets...")
                                 cleanup_result = learner.run_wallet_cleanup(
-                                    webhook_manager=trading_system.webhook_manager,
+                                    webhook_manager=trading_system.multi_webhook_manager,
                                     db=trading_system.db,
                                     dry_run=False  # Actually remove!
                                 )
