@@ -1,0 +1,27 @@
+{
+  "exported_at": "2026-01-28T21:07:12.296559",
+  "summary": {
+    "balance": 10.0,
+    "starting_balance": 10.0,
+    "return_pct": 0.0,
+    "total_pnl_sol": 0.0,
+    "total_trades": 0,
+    "winning_trades": 0,
+    "win_rate": 0.0,
+    "avg_win_pct": 0,
+    "avg_loss_pct": 0,
+    "profit_factor": Infinity,
+    "best_trade_pct": 0.0,
+    "worst_trade_pct": 0.0,
+    "max_drawdown_pct": 0.0,
+    "current_streak": 0,
+    "open_positions": 0,
+    "by_exit_reason": {}
+  },
+  "analysis": {
+    "status": "no_data",
+    "trades": 0
+  },
+  "daily_performance": [],
+  "all_trades": []
+}
