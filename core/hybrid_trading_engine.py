@@ -544,28 +544,34 @@ def create_hybrid_engine(paper_engine, notifier=None) -> HybridTradingEngine:
         from hybrid_trading_engine import create_hybrid_engine
         hybrid = create_hybrid_engine(paper_engine, notifier)
     """
-    from dotenv import load_dotenv
-    load_dotenv()
+    # Try to import secrets manager
+    try:
+        from core.secrets_manager import get_secret
+    except ImportError:
+        from dotenv import load_dotenv
+        load_dotenv()
+        def get_secret(key, default=None):
+            return os.getenv(key, default)
     
     # Check if live trading should be enabled
-    enable_live = os.getenv('ENABLE_LIVE_TRADING', '').lower() == 'true'
+    enable_live = get_secret('ENABLE_LIVE_TRADING', '').lower() == 'true'
     
     # Create config
     config = HybridTradingConfig(
         enable_live_trading=enable_live,
         enable_paper_trading=True,  # Always keep paper for comparison
-        position_size_sol=float(os.getenv('POSITION_SIZE_SOL', '0.08')),
-        max_open_positions=int(os.getenv('MAX_OPEN_POSITIONS', '10')),
-        max_daily_loss_sol=float(os.getenv('MAX_DAILY_LOSS_SOL', '0.25')),
-        min_conviction=int(os.getenv('MIN_CONVICTION', '60')),
+        position_size_sol=float(get_secret('POSITION_SIZE_SOL', '0.08')),
+        max_open_positions=int(get_secret('MAX_OPEN_POSITIONS', '10')),
+        max_daily_loss_sol=float(get_secret('MAX_DAILY_LOSS_SOL', '0.25')),
+        min_conviction=int(get_secret('MIN_CONVICTION', '60')),
     )
     
     # Create live engine if enabled
     live_engine = None
     
     if enable_live:
-        private_key = os.getenv('SOLANA_PRIVATE_KEY')
-        helius_key = os.getenv('HELIUS_KEY')
+        private_key = get_secret('SOLANA_PRIVATE_KEY')
+        helius_key = get_secret('HELIUS_KEY')
         
         if private_key:
             try:

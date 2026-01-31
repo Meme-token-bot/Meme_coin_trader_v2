@@ -41,6 +41,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger("LiveTrader")
 
+# Import secrets manager if available
+try:
+    from core.secrets_manager import get_secret
+    SECRETS_AVAILABLE = True
+except ImportError:
+    SECRETS_AVAILABLE = False
+    def get_secret(key, default=None):
+        return os.getenv(key, default)
+
 # Solana imports
 try:
     from solders.keypair import Keypair
@@ -636,7 +645,7 @@ class LiveTradingEngine:
                 logger.error(f"Failed to load wallet: {e}")
         
         # Solana client
-        self.helius_key = helius_key or os.getenv('HELIUS_KEY')
+        self.helius_key = helius_key or get_secret('HELIUS_KEY')
         if self.helius_key:
             self.rpc_url = f"https://mainnet.helius-rpc.com/?api-key={self.helius_key}"
             self.solana_client = SolanaClient(self.rpc_url) if SOLANA_AVAILABLE else None
@@ -1310,8 +1319,14 @@ class LiveTradingEngine:
 def main():
     """CLI interface"""
     import argparse
-    from dotenv import load_dotenv
-    load_dotenv()
+    
+    # Try to initialize secrets
+    try:
+        from core.secrets_manager import init_secrets
+        init_secrets()
+    except ImportError:
+        from dotenv import load_dotenv
+        load_dotenv()
     
     parser = argparse.ArgumentParser(description="Live Trading Engine")
     parser.add_argument('command', choices=['status', 'positions', 'validate', 'enable', 'disable', 'kill'],
@@ -1321,13 +1336,13 @@ def main():
     
     # Initialize engine
     config = LiveTradingConfig(
-        enable_live_trading=os.getenv('ENABLE_LIVE_TRADING', '').lower() == 'true',
-        position_size_sol=float(os.getenv('POSITION_SIZE_SOL', '0.08'))
+        enable_live_trading=get_secret('ENABLE_LIVE_TRADING', '').lower() == 'true',
+        position_size_sol=float(get_secret('POSITION_SIZE_SOL', '0.08'))
     )
     
     engine = LiveTradingEngine(
-        private_key=os.getenv('SOLANA_PRIVATE_KEY'),
-        helius_key=os.getenv('HELIUS_KEY'),
+        private_key=get_secret('SOLANA_PRIVATE_KEY'),
+        helius_key=get_secret('HELIUS_KEY'),
         config=config
     )
     

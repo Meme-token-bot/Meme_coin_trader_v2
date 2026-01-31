@@ -29,9 +29,27 @@ from dataclasses import dataclass, field
 from collections import deque
 
 from flask import Flask, request, jsonify
-from dotenv import load_dotenv
 
-load_dotenv()
+# =============================================================================
+# SECRETS MANAGEMENT (AWS Secrets Manager or .env fallback)
+# =============================================================================
+try:
+    from core.secrets_manager import init_secrets, get_secret, get_secrets
+    
+    # Initialize secrets at startup - this loads from AWS Secrets Manager
+    # and sets them as environment variables for backward compatibility
+    print("🔐 Initializing secrets...")
+    init_secrets()
+    SECRETS_AVAILABLE = True
+except ImportError:
+    print("⚠️ Secrets manager not available, falling back to .env")
+    from dotenv import load_dotenv
+    load_dotenv()
+    SECRETS_AVAILABLE = False
+    
+    def get_secret(key, default=None):
+        import os
+        return os.getenv(key, default)
 
 from core.database_v2 import DatabaseV2
 from core.discovery_integration import HistorianV8 as Historian
@@ -132,9 +150,22 @@ class MasterConfig:
 
 CONFIG = MasterConfig()
 
-# Override from environment
-if os.getenv('ENABLE_LIVE_TRADING', '').lower() == 'true':
-    CONFIG.enable_live_trading = True
+# Override from secrets/environment
+# Note: This happens after secrets are initialized in the imports
+def _update_config_from_secrets():
+    """Update CONFIG from secrets after they're loaded"""
+    if get_secret('ENABLE_LIVE_TRADING', '').lower() == 'true':
+        CONFIG.enable_live_trading = True
+    if get_secret('POSITION_SIZE_SOL'):
+        try:
+            CONFIG.live_position_size_sol = float(get_secret('POSITION_SIZE_SOL'))
+        except:
+            pass
+    if get_secret('MAX_OPEN_POSITIONS'):
+        try:
+            CONFIG.max_live_positions = int(get_secret('MAX_OPEN_POSITIONS'))
+        except:
+            pass
 
 
 class RateLimiter:
@@ -257,8 +288,8 @@ class Notifier:
     """Minimal Telegram notifications"""
     
     def __init__(self, token: str = None, chat_id: str = None):
-        self.token = token or os.getenv('TELEGRAM_BOT_TOKEN')
-        self.chat_id = chat_id or os.getenv('TELEGRAM_CHAT_ID')
+        self.token = token or get_secret('TELEGRAM_BOT_TOKEN')
+        self.chat_id = chat_id or get_secret('TELEGRAM_CHAT_ID')
         self.enabled = bool(self.token and self.chat_id)
         self._last_30min_update = datetime.now() - timedelta(minutes=30)
         self._last_stats = {}
@@ -555,12 +586,13 @@ class TradingSystem:
         
         set_platform_verbosity(CONFIG.verbosity)
         
-        self.helius_key = os.getenv('HELIUS_KEY')
-        self.anthropic_key = os.getenv('ANTHROPIC_API_KEY')
-        self.webhook_id = os.getenv('HELIUS_WEBHOOK_ID')
+        # Load API keys from secrets (AWS Secrets Manager or .env)
+        self.helius_key = get_secret('HELIUS_KEY')
+        self.anthropic_key = get_secret('ANTHROPIC_API_KEY')
+        self.webhook_id = get_secret('HELIUS_WEBHOOK_ID')
         
         if not self.helius_key:
-            raise ValueError("HELIUS_KEY not set!")
+            raise ValueError("HELIUS_KEY not found in secrets!")
         
         print("\n📦 Loading Components...")
         
@@ -609,7 +641,7 @@ class TradingSystem:
         self.rate_limiter = RateLimiter(CONFIG.max_token_lookups_per_minute, CONFIG.max_api_calls_per_hour)
         self.diagnostics = DiagnosticsTracker()
         
-        webhook_url = os.getenv('WEBHOOK_URL', f'http://0.0.0.0:{CONFIG.webhook_port}/webhook/helius')
+        webhook_url = get_secret('WEBHOOK_URL') or f'http://0.0.0.0:{CONFIG.webhook_port}/webhook/helius'
 
         try:
             from infrastructure.multi_webhook_manager import MultiWebhookManager
@@ -619,7 +651,7 @@ class TradingSystem:
             self.multi_webhook_manager = None
 
         if CONFIG.discovery_enabled:
-            discovery_key = os.getenv('HELIUS_DISCOVERY_KEY')
+            discovery_key = get_secret('HELIUS_DISCOVERY_KEY')
             self.historian = Historian(
                 self.db, 
                 self.helius_key, 
@@ -1387,6 +1419,9 @@ def main():
     print("\n" + "="*70)
     print("🔧 STARTING PAPER + LIVE TRADING SYSTEM")
     print("="*70)
+    
+    # Update config from secrets (now that they're loaded)
+    _update_config_from_secrets()
     
     try:
         trading_system = TradingSystem()
