@@ -31,7 +31,7 @@ Author: Trading Bot System
 import os
 import json
 import logging
-from typing import Dict, Optional
+from typing import Dict, Optional, Any
 
 logger = logging.getLogger("SecretsManager")
 
@@ -76,8 +76,15 @@ def _get_boto3_client():
         return None
 
 
-def _fetch_secret_from_aws(secret_name: str) -> Optional[Dict]:
-    """Fetch a secret from AWS Secrets Manager"""
+def _fetch_secret_from_aws(secret_name: str) -> Optional[Any]:
+    """Fetch a secret from AWS Secrets Manager
+    
+    Returns:
+        - Dict if secret is JSON object
+        - List if secret is JSON array
+        - String if secret is plain text
+        - None if error
+    """
     client = _get_boto3_client()
     
     if not client:
@@ -86,11 +93,19 @@ def _fetch_secret_from_aws(secret_name: str) -> Optional[Dict]:
     try:
         response = client.get_secret_value(SecretId=secret_name)
         
-        # Parse the secret string (JSON format)
+        # Parse the secret string
         if 'SecretString' in response:
-            secret_data = json.loads(response['SecretString'])
-            logger.info(f"✅ Loaded secret: {secret_name}")
-            return secret_data
+            secret_string = response['SecretString']
+            
+            # Try to parse as JSON (could be object or array)
+            try:
+                secret_data = json.loads(secret_string)
+                logger.info(f"✅ Loaded secret: {secret_name} (type: {type(secret_data).__name__})")
+                return secret_data
+            except json.JSONDecodeError:
+                # Not JSON, return as plain string
+                logger.info(f"✅ Loaded secret: {secret_name} (plain string)")
+                return secret_string
         else:
             # Binary secret
             logger.warning(f"Secret {secret_name} is binary, not supported")
@@ -143,18 +158,44 @@ class SecretsLoader:
             # Load wallet private key
             wallet_secret = _fetch_secret_from_aws(SECRETS_CONFIG['wallet'])
             if wallet_secret:
-                # The wallet secret might have the key under different names
-                if 'SOLANA_PRIVATE_KEY' in wallet_secret:
-                    self._secrets['SOLANA_PRIVATE_KEY'] = wallet_secret['SOLANA_PRIVATE_KEY']
-                elif 'private_key' in wallet_secret:
-                    self._secrets['SOLANA_PRIVATE_KEY'] = wallet_secret['private_key']
-                elif 'PRIVATE_KEY' in wallet_secret:
-                    self._secrets['SOLANA_PRIVATE_KEY'] = wallet_secret['PRIVATE_KEY']
+                # Handle different secret formats:
+                # 1. Dict with key: {"SOLANA_PRIVATE_KEY": "base58string"}
+                # 2. Dict with key: {"private_key": "base58string"}
+                # 3. List (Solana CLI format): [123, 45, 67, ...] - need to convert to base58
+                # 4. Raw string (already base58)
+                
+                if isinstance(wallet_secret, dict):
+                    if 'SOLANA_PRIVATE_KEY' in wallet_secret:
+                        self._secrets['SOLANA_PRIVATE_KEY'] = wallet_secret['SOLANA_PRIVATE_KEY']
+                    elif 'private_key' in wallet_secret:
+                        self._secrets['SOLANA_PRIVATE_KEY'] = wallet_secret['private_key']
+                    elif 'PRIVATE_KEY' in wallet_secret:
+                        self._secrets['SOLANA_PRIVATE_KEY'] = wallet_secret['PRIVATE_KEY']
+                    else:
+                        # Use the first value
+                        for key, value in wallet_secret.items():
+                            self._secrets['SOLANA_PRIVATE_KEY'] = value
+                            break
+                
+                elif isinstance(wallet_secret, list):
+                    # Solana CLI format - array of bytes, convert to base58
+                    try:
+                        import base58
+                        keypair_bytes = bytes(wallet_secret)
+                        private_key_base58 = base58.b58encode(keypair_bytes).decode('utf-8')
+                        self._secrets['SOLANA_PRIVATE_KEY'] = private_key_base58
+                        logger.info("  ✅ Converted keypair array to base58")
+                    except ImportError:
+                        logger.error("  ❌ base58 module required. Run: pip install base58")
+                    except Exception as e:
+                        logger.error(f"  ❌ Failed to convert keypair: {e}")
+                
+                elif isinstance(wallet_secret, str):
+                    # Already a string (base58)
+                    self._secrets['SOLANA_PRIVATE_KEY'] = wallet_secret
+                
                 else:
-                    # If it's a single value secret, use the first value
-                    for key, value in wallet_secret.items():
-                        self._secrets['SOLANA_PRIVATE_KEY'] = value
-                        break
+                    logger.warning(f"  ⚠️ Unknown wallet secret format: {type(wallet_secret)}")
             
             if self._secrets:
                 logger.info(f"✅ Loaded {len(self._secrets)} secrets from AWS")
