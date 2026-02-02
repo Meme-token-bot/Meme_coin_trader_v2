@@ -56,6 +56,7 @@ from core.discovery_integration import HistorianV8 as Historian
 from core.strategist_v2 import Strategist
 from core.discovery_config import config as discovery_config
 from infrastructure.helius_webhook_manager import HeliusWebhookManager
+from core.stealth_trading_coordinator import StealthTradingCoordinator
 
 # ============================================================================
 # IMPORT FIXED V6 PAPER TRADING PLATFORM
@@ -613,6 +614,31 @@ class TradingSystem:
             print(f"  ✅ Fixed V6 Paper Trading (Max: {CONFIG.max_open_positions} positions)")
         else:
             self.paper_engine = None
+
+        # Initialize stealth coordinator
+        self.stealth = StealthTradingCoordinator(
+            helius_key=self.helius_key,
+            telegram_token=get_secret('TELEGRAM_BOT_TOKEN'),
+            telegram_chat_id=get_secret('TELEGRAM_CHAT_ID')
+        )
+
+        # Load wallet keys
+        wallet_secrets = {
+            'HOT_WALLET_1': get_secret('HOT_WALLET_1'),
+            'HOT_WALLET_2': get_secret('HOT_WALLET_2'),
+            'HOT_WALLET_3': get_secret('HOT_WALLET_3'),
+            'HOT_WALLET_4': get_secret('HOT_WALLET_4'),
+            'HOT_WALLET_5': get_secret('HOT_WALLET_5'),
+            'BURNER_ADDRESS_1': get_secret('BURNER_ADDRESS_1'),
+            'BURNER_ADDRESS_2': get_secret('BURNER_ADDRESS_2'),
+            'BURNER_ADDRESS_3': get_secret('BURNER_ADDRESS_3'),
+            'BURNER_ADDRESS_4': get_secret('BURNER_ADDRESS_4'),
+            'BURNER_ADDRESS_5': get_secret('BURNER_ADDRESS_5')
+        }
+        self.stealth.load_wallet_keys(wallet_secrets)
+
+        # Start background tasks
+        self.stealth.start_background_tasks()
         
         # ======================================================================
         # INITIALIZE HYBRID TRADING ENGINE (Paper + Live)
@@ -789,7 +815,8 @@ class TradingSystem:
         return None
     
     def _process_buy(self, trade: Dict, wallet_data: Dict, token_addr: str, signature: str) -> Dict:
-        result = {'processed': True, 'action': 'BUY_SIGNAL', 'reason': ''}
+        # Use stealth coordinator instead of single wallet
+        result = self.stealth.execute_buy(signal)
         
         if self.db.is_position_tracked(wallet_data['address'], token_addr):
             result['reason'] = 'Position already tracked'
