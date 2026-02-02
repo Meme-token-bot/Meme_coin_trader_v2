@@ -54,9 +54,14 @@ except ImportError:
 try:
     from solders.keypair import Keypair
     from solders.pubkey import Pubkey
-    from solders.transaction import VersionedTransaction
+    from solders.transaction import VersionedTransaction, Transaction
     from solders.signature import Signature
+    from solders.message import MessageV0, Message
+    from solders.system_program import transfer, TransferParams
+    from solders.hash import Hash
+    from solders.instruction import Instruction, CompiledInstruction
     from solana.rpc.api import Client as SolanaClient
+    from solana.rpc.commitment import Confirmed
     SOLANA_AVAILABLE = True
 except ImportError:
     SOLANA_AVAILABLE = False
@@ -76,7 +81,7 @@ JUPITER_SWAP_URL = "https://quote-api.jup.ag/v6/swap"
 JUPITER_PRICE_URL = "https://price.jup.ag/v6/price"
 
 # Jito endpoints
-JITO_BLOCK_ENGINE_URL = "https://mainnet.block-engine.jito.wtf"
+JITO_BLOCK_ENGINE_URL = "https://slc.mainnet.block-engine.jito.wtf"
 JITO_BUNDLE_URL = f"{JITO_BLOCK_ENGINE_URL}/api/v1/bundles"
 JITO_TIP_ACCOUNTS = [
     "96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5",
@@ -225,30 +230,33 @@ class PriceService:
 # =============================================================================
 
 class JitoBundleService:
-    """Jito bundle submission for MEV protection"""
+    """Jito bundle submission for MEV protection and fast execution"""
     
     def __init__(self, keypair: Keypair):
         self.keypair = keypair
         self._tip_account_index = 0
     
     def get_tip_account(self) -> str:
-        """Rotate through tip accounts"""
+        """Rotate through tip accounts for load balancing"""
         account = JITO_TIP_ACCOUNTS[self._tip_account_index]
         self._tip_account_index = (self._tip_account_index + 1) % len(JITO_TIP_ACCOUNTS)
         return account
     
-    def submit_bundle(self, transactions: List[str], tip_lamports: int = 1_000_000) -> Optional[str]:
+    def submit_bundle(self, transactions: List[str], tip_lamports: int = None) -> Optional[str]:
         """
         Submit a bundle to Jito block engine.
         
         Args:
-            transactions: List of base64 encoded transactions
-            tip_lamports: Tip amount in lamports
+            transactions: List of base64 encoded signed transactions
+                         [swap_tx, tip_tx] - swap first, tip second
+            tip_lamports: (deprecated, tip should be in transactions)
         
         Returns:
             Bundle ID if successful
         """
         try:
+            logger.info(f"📤 Submitting Jito bundle with {len(transactions)} transactions...")
+            
             payload = {
                 "jsonrpc": "2.0",
                 "id": 1,
@@ -266,20 +274,33 @@ class JitoBundleService:
             if resp.status_code == 200:
                 result = resp.json()
                 if 'result' in result:
-                    logger.info(f"🚀 Jito bundle submitted: {result['result']}")
-                    return result['result']
+                    bundle_id = result['result']
+                    logger.info(f"🚀 Jito bundle accepted: {bundle_id}")
+                    return bundle_id
                 elif 'error' in result:
-                    logger.error(f"Jito error: {result['error']}")
+                    error_msg = result['error']
+                    logger.error(f"❌ Jito bundle rejected: {error_msg}")
+                    # Common errors:
+                    # - "Bundle contains invalid transactions" - signatures wrong
+                    # - "Bundle too old" - blockhash expired
+                    # - "Insufficient tip" - need higher tip
             else:
-                logger.error(f"Jito HTTP error: {resp.status_code}")
+                logger.error(f"❌ Jito HTTP error: {resp.status_code} - {resp.text[:200]}")
         
+        except requests.exceptions.Timeout:
+            logger.error("⏱️ Jito request timed out")
         except Exception as e:
-            logger.error(f"Jito bundle submission failed: {e}")
+            logger.error(f"❌ Jito bundle submission failed: {e}")
         
         return None
     
     def get_bundle_status(self, bundle_id: str) -> Optional[str]:
-        """Check bundle status"""
+        """
+        Check bundle status from Jito.
+        
+        Returns:
+            Status string: 'pending', 'landed', 'finalized', 'invalid', 'failed', or None
+        """
         try:
             payload = {
                 "jsonrpc": "2.0",
@@ -298,8 +319,14 @@ class JitoBundleService:
             if resp.status_code == 200:
                 result = resp.json()
                 statuses = result.get('result', {}).get('value', [])
-                if statuses:
-                    return statuses[0].get('confirmation_status')
+                if statuses and len(statuses) > 0:
+                    bundle_status = statuses[0]
+                    if bundle_status:
+                        # Jito returns confirmation_status or status
+                        status = bundle_status.get('confirmation_status') or bundle_status.get('status')
+                        if status:
+                            logger.debug(f"Bundle {bundle_id[:8]}... status: {status}")
+                            return status.lower()
         except Exception as e:
             logger.warning(f"Bundle status check failed: {e}")
         
@@ -737,6 +764,77 @@ class LiveTradingEngine:
         
         return True, "OK"
     
+    def validate_jito_setup(self) -> Tuple[bool, str]:
+        """
+        Validate that Jito bundle execution is properly configured.
+        Call this before enabling live trading!
+        
+        Returns:
+            (success, message)
+        """
+        issues = []
+        
+        # Check Solana libraries
+        if not SOLANA_AVAILABLE:
+            issues.append("Solana libraries not installed")
+        
+        # Check keypair
+        if not self.keypair:
+            issues.append("No wallet keypair configured")
+        
+        # Check Jito service
+        if not self.jito:
+            issues.append("Jito service not initialized")
+        else:
+            # Test tip account rotation
+            tip_account = self.jito.get_tip_account()
+            if not tip_account:
+                issues.append("Failed to get Jito tip account")
+        
+        # Check RPC client
+        if not self.solana_client:
+            issues.append("Solana RPC client not configured")
+        else:
+            # Test RPC connection
+            try:
+                resp = self.solana_client.get_health()
+                if resp != 'ok':
+                    issues.append(f"RPC health check returned: {resp}")
+            except Exception as e:
+                issues.append(f"RPC health check failed: {e}")
+        
+        # Check balance
+        balance = self.get_sol_balance()
+        if balance < self.config.position_size_sol + self.config.jito_tip_lamports / LAMPORTS_PER_SOL:
+            issues.append(f"Insufficient balance: {balance:.4f} SOL")
+        
+        # Check tip amount is reasonable
+        tip_sol = self.config.jito_tip_lamports / LAMPORTS_PER_SOL
+        if tip_sol < 0.0001:
+            issues.append(f"Tip too low ({tip_sol} SOL) - may not be prioritized")
+        if tip_sol > 0.01:
+            issues.append(f"Tip very high ({tip_sol} SOL) - consider reducing")
+        
+        if issues:
+            return False, "; ".join(issues)
+        
+        return True, f"✅ Jito setup validated. Balance: {balance:.4f} SOL, Tip: {tip_sol:.4f} SOL"
+    
+    def test_jito_connection(self) -> bool:
+        """Test Jito block engine connectivity"""
+        try:
+            # Simple connectivity test to Jito
+            resp = requests.get(
+                f"{JITO_BLOCK_ENGINE_URL}/api/v1/bundles",
+                timeout=10
+            )
+            # Even if we get an error response, connectivity is working
+            logger.info(f"Jito connectivity test: {resp.status_code}")
+            return resp.status_code in [200, 400, 405]  # Various valid responses
+        except Exception as e:
+            logger.error(f"Jito connectivity test failed: {e}")
+            return False
+    
     def execute_buy(self, signal: Dict) -> Dict:
         """
         Execute a buy order.
@@ -1136,32 +1234,105 @@ class LiveTradingEngine:
         return None
     
     def _execute_via_jito(self, swap_tx_base64: str) -> Optional[str]:
-        """Execute transaction via Jito bundle"""
+        """
+        Execute transaction via Jito bundle with proper tip.
+        
+        Jito requires a bundle with:
+        1. Your swap transaction
+        2. A tip transaction paying a Jito validator
+        
+        Without the tip, Jito won't prioritize your bundle!
+        """
         try:
-            # Decode and sign transaction
-            tx_bytes = base64.b64decode(swap_tx_base64)
-            tx = VersionedTransaction.from_bytes(tx_bytes)
+            # 1. Decode the swap transaction (unsigned from Jupiter)
+            swap_tx_bytes = base64.b64decode(swap_tx_base64)
+            swap_tx = VersionedTransaction.from_bytes(swap_tx_bytes)
             
-            # Sign
-            tx.sign([self.keypair])
+            # 2. Get a fresh blockhash for the tip transaction
+            blockhash_resp = self.solana_client.get_latest_blockhash()
+            recent_blockhash = blockhash_resp.value.blockhash
             
-            # Re-encode
-            signed_tx = base64.b64encode(bytes(tx)).decode('utf-8')
+            # 3. Create the tip transaction
+            tip_account_pubkey = Pubkey.from_string(self.jito.get_tip_account())
+            tip_lamports = self.config.jito_tip_lamports
             
-            # Submit bundle
-            bundle_id = self.jito.submit_bundle([signed_tx], self.config.jito_tip_lamports)
+            # Create transfer instruction for the tip
+            tip_instruction = transfer(
+                TransferParams(
+                    from_pubkey=self.keypair.pubkey(),
+                    to_pubkey=tip_account_pubkey,
+                    lamports=tip_lamports
+                )
+            )
+            
+            # Create tip transaction message
+            tip_message = Message.new_with_blockhash(
+                [tip_instruction],
+                self.keypair.pubkey(),
+                recent_blockhash
+            )
+            
+            # Create and sign tip transaction
+            tip_tx = Transaction.new_unsigned(tip_message)
+            tip_tx.sign([self.keypair], recent_blockhash)
+            
+            # 4. Sign the swap transaction
+            swap_tx.sign([self.keypair])
+            
+            # 5. Encode both transactions for the bundle
+            signed_swap = base64.b64encode(bytes(swap_tx)).decode('utf-8')
+            signed_tip = base64.b64encode(bytes(tip_tx)).decode('utf-8')
+            
+            # 6. Submit bundle: [swap_tx, tip_tx]
+            # Note: Swap first, tip second (tip is the "bribe" for including the swap)
+            bundle_id = self.jito.submit_bundle([signed_swap, signed_tip])
             
             if bundle_id:
+                logger.info(f"📦 Jito bundle submitted: {bundle_id[:16]}... (tip: {tip_lamports/LAMPORTS_PER_SOL:.4f} SOL)")
+                
                 # Wait for bundle confirmation
-                for _ in range(30):  # 30 second timeout
-                    status = self.jito.get_bundle_status(bundle_id)
-                    if status in ['confirmed', 'finalized']:
-                        # Get signature from transaction
-                        return str(tx.signatures[0])
+                for attempt in range(30):  # 30 second timeout
                     time.sleep(1)
+                    status = self.jito.get_bundle_status(bundle_id)
+                    
+                    if status == 'landed':
+                        logger.info(f"✅ Jito bundle landed!")
+                        return str(swap_tx.signatures[0])
+                    elif status == 'finalized':
+                        logger.info(f"✅ Jito bundle finalized!")
+                        return str(swap_tx.signatures[0])
+                    elif status in ['invalid', 'failed']:
+                        logger.error(f"❌ Jito bundle failed: {status}")
+                        break
+                    
+                    # Also check if transaction is on chain directly
+                    if attempt > 5:
+                        try:
+                            sig = Signature.from_string(str(swap_tx.signatures[0]))
+                            tx_resp = self.solana_client.get_signature_statuses([sig])
+                            if tx_resp.value and tx_resp.value[0]:
+                                if tx_resp.value[0].confirmation_status:
+                                    logger.info(f"✅ Transaction confirmed on chain!")
+                                    return str(swap_tx.signatures[0])
+                        except:
+                            pass
+                
+                # If bundle didn't confirm, still return signature to check later
+                logger.warning(f"⚠️ Jito bundle status unclear, returning signature for manual check")
+                return str(swap_tx.signatures[0])
+            
+            # Bundle submission failed
+            logger.error("❌ Failed to submit Jito bundle")
+            return None
             
         except Exception as e:
             logger.error(f"Jito execution error: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            # Fallback to regular RPC if Jito fails
+            logger.info("↩️ Falling back to regular RPC...")
+            return self._execute_via_rpc(swap_tx_base64)
         
         return None
     
@@ -1329,7 +1500,8 @@ def main():
         load_dotenv()
     
     parser = argparse.ArgumentParser(description="Live Trading Engine")
-    parser.add_argument('command', choices=['status', 'positions', 'validate', 'enable', 'disable', 'kill'],
+    parser.add_argument('command', 
+                       choices=['status', 'positions', 'validate', 'validate-jito', 'test-jito', 'enable', 'disable', 'kill'],
                        help='Command to run')
     
     args = parser.parse_args()
@@ -1362,11 +1534,41 @@ def main():
         print(f"\nCan trade: {'✅ YES' if can_trade else '❌ NO'}")
         print(f"Reason: {reason}")
     
+    elif args.command == 'validate-jito':
+        print("\n🔧 VALIDATING JITO SETUP")
+        print("=" * 50)
+        
+        success, message = engine.validate_jito_setup()
+        print(f"\n{message}")
+        
+        if success:
+            print("\n✅ Jito is properly configured!")
+            print(f"   Tip per transaction: {engine.config.jito_tip_lamports / LAMPORTS_PER_SOL:.4f} SOL")
+            print(f"   Jito bundles enabled: {engine.config.enable_jito_bundles}")
+        else:
+            print("\n❌ Jito setup has issues - fix before live trading!")
+    
+    elif args.command == 'test-jito':
+        print("\n🧪 TESTING JITO CONNECTIVITY")
+        print("=" * 50)
+        
+        if engine.test_jito_connection():
+            print("✅ Jito block engine is reachable!")
+        else:
+            print("❌ Cannot reach Jito block engine")
+            print("   Check your network connection and firewall")
+    
     elif args.command == 'enable':
-        print("To enable live trading, set ENABLE_LIVE_TRADING=true in .env")
+        print("To enable live trading:")
+        print("1. In AWS Secrets Manager, set ENABLE_LIVE_TRADING=true")
+        print("2. Restart the bot")
+        print("\nOr via API: POST /live/enable?confirm=LIVE")
     
     elif args.command == 'disable':
-        print("To disable, set ENABLE_LIVE_TRADING=false in .env")
+        print("To disable live trading:")
+        print("1. In AWS Secrets Manager, set ENABLE_LIVE_TRADING=false")
+        print("2. Restart the bot")
+        print("\nOr via API: POST /live/disable")
     
     elif args.command == 'kill':
         confirm = input("⚠️ This will close ALL positions. Type 'KILL' to confirm: ")
