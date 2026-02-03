@@ -60,7 +60,7 @@ try:
     from solders.message import MessageV0, Message
     from solders.system_program import transfer, TransferParams
     from solders.hash import Hash
-    from solders.instruction import Instruction, CompiledInstruction
+    from solders.instruction import Instruction, CompiledInstruction, AccountMeta
     from solana.rpc.api import Client as SolanaClient
     from solana.rpc.commitment import Confirmed
     SOLANA_AVAILABLE = True
@@ -1287,6 +1287,9 @@ class LiveTradingEngine:
             'wrapAndUnwrapSol': True,
             'prioritizationFeeLamports': self.config.priority_fee_lamports
         }
+        if self.config.use_helius_sender:
+            payload['asLegacyTransaction'] = True
+            payload['useSharedAccounts'] = False
         metis_url = get_secret('QUICKNODE_METIS_URL')
         if metis_url:
             metis_url = metis_url.rstrip('/')
@@ -1447,13 +1450,13 @@ class LiveTradingEngine:
             tx_bytes = base64.b64decode(swap_tx_base64)
             try:
                 tx = Transaction.from_bytes(tx_bytes)
-                tx = self._inject_helius_tip(tx)
-                tx.sign([self.keypair], tx.message.recent_blockhash)
-                tx_base64 = base64.b64encode(bytes(tx)).decode("utf-8")
-            except Exception:
-                tx = VersionedTransaction.from_bytes(tx_bytes)
-                tx = self._sign_versioned_transaction(tx)
-                tx_base64 = base64.b64encode(bytes(tx)).decode("utf-8")
+            except Exception as e:
+                logger.error(f"Helius sender requires legacy transactions: {e}")
+                return None
+
+            tx = self._inject_helius_tip(tx)
+            tx.sign([self.keypair], tx.message.recent_blockhash)
+            tx_base64 = base64.b64encode(bytes(tx)).decode("utf-8")
 
             header_name = get_secret("HELIUS_PRIORITY_HEADER", "x-helius-priority")
             header_value = get_secret("HELIUS_PRIORITY_VALUE", "true")
@@ -1494,9 +1497,27 @@ class LiveTradingEngine:
         account_keys = list(message.account_keys)
         payer = account_keys[0]
         instructions = []
+        header = message.header
+        num_required = header.num_required_signatures
+        num_readonly_signed = getattr(header, "num_readonly_signed", None)
+        if num_readonly_signed is None:
+            num_readonly_signed = header.num_readonly_signed_accounts
+        num_readonly_unsigned = getattr(header, "num_readonly_unsigned", None)
+        if num_readonly_unsigned is None:
+            num_readonly_unsigned = header.num_readonly_unsigned_accounts
+        writable_signed_cutoff = num_required - num_readonly_signed
+        writable_unsigned_cutoff = len(account_keys) - num_readonly_unsigned
+
         for compiled in message.instructions:
             program_id = account_keys[compiled.program_id_index]
-            accounts = [account_keys[i] for i in compiled.accounts]
+            accounts = [
+                AccountMeta(
+                    account_keys[i],
+                    i < num_required,
+                    (i < writable_signed_cutoff) if i < num_required else (i < writable_unsigned_cutoff)
+                )
+                for i in compiled.accounts
+            ]
             instructions.append(Instruction(program_id, compiled.data, accounts))
 
         tip_pubkey = Pubkey.from_string(random.choice(HELIUS_TIP_ACCOUNTS))
