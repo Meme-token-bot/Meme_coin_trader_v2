@@ -662,10 +662,21 @@ class LiveTradingEngine:
         # Load wallet
         self.keypair = None
         self.wallet_pubkey = None
+        if private_key is None:
+            private_key = get_secret('SOLANA_PRIVATE_KEY') or get_secret('HOT_WALLET_1')
         
         if private_key:
             try:
-                self.keypair = Keypair.from_base58_string(private_key)
+                if isinstance(private_key, list):
+                    self.keypair = Keypair.from_bytes(bytes(private_key))
+                elif isinstance(private_key, dict):
+                    key_value = private_key.get('private_key') or private_key.get('value')
+                    if not key_value:
+                        raise ValueError("Unsupported key dict format")
+                    self.keypair = Keypair.from_base58_string(key_value)
+                else:
+                    self.keypair = Keypair.from_base58_string(private_key)
+                
                 self.wallet_pubkey = str(self.keypair.pubkey())
                 logger.info(f"🔐 Wallet loaded: {self.wallet_pubkey[:8]}...{self.wallet_pubkey[-4:]}")
             except Exception as e:
@@ -797,9 +808,12 @@ class LiveTradingEngine:
         else:
             # Test RPC connection
             try:
-                resp = self.solana_client.get_health()
-                if resp != 'ok':
-                    issues.append(f"RPC health check returned: {resp}")
+                if hasattr(self.solana_client, 'get_health'):
+                    resp = self.solana_client.get_health()
+                    if resp != 'ok':
+                        issues.append(f"RPC health check returned: {resp}")
+                else:
+                    self.solana_client.get_latest_blockhash()
             except Exception as e:
                 issues.append(f"RPC health check failed: {e}")
         
