@@ -1402,7 +1402,15 @@ class LiveTradingEngine:
         if hasattr(tx, "sign"):
             tx.sign([self.keypair])
             return tx
-        return VersionedTransaction.populate(tx.message, [self.keypair])
+        message = tx.message
+        try:
+            message_bytes = bytes(message)
+        except Exception:
+            message_bytes = message.serialize()
+        signature = self.keypair.sign_message(message_bytes)
+        if not isinstance(signature, Signature):
+            signature = Signature.from_bytes(signature)
+        return VersionedTransaction.populate(message, [signature])
     
     def _wait_for_confirmation(self, signature: str, timeout: int = None) -> bool:
         """Wait for transaction confirmation"""
