@@ -77,9 +77,9 @@ SOL_MINT = "So11111111111111111111111111111111111111112"
 LAMPORTS_PER_SOL = 1_000_000_000
 
 # API Endpoints
-JUPITER_QUOTE_URL = "https://quote-api.jup.ag/v6/quote"
-JUPITER_SWAP_URL = "https://quote-api.jup.ag/v6/swap"
-JUPITER_PRICE_URL = "https://price.jup.ag/v6/price"
+JUPITER_QUOTE_URL = "https://public.jupiterapi.com/quote"
+JUPITER_SWAP_URL = "https://public.jupiterapi.com/swap"
+JUPITER_PRICE_URL = "https://api.jup.ag/price/v2/full"
 
 # Jito endpoints
 JITO_BLOCK_ENGINE_URL = "https://slc.mainnet.block-engine.jito.wtf"
