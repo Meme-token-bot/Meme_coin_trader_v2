@@ -151,6 +151,7 @@ class LiveTradingConfig:
     enable_live_trading: bool = False        # MUST be True to trade
     enable_jito_bundles: bool = True         # Use Jito for speed
     parallel_paper_trading: bool = True      # Run paper alongside
+    use_helius_sender: bool = False           # Use Helius RPC sender instead of Jito
     
     # Tax (NZ)
     tax_year_start_month: int = 4            # April
@@ -672,6 +673,10 @@ class LiveTradingEngine:
         self.config = config or LiveTradingConfig()
         if not self.config.enable_live_trading:
             self.config.enable_live_trading = get_secret('ENABLE_LIVE_TRADING', '').lower() == 'true'
+        if not self.config.use_helius_sender:
+            self.config.use_helius_sender = get_secret('USE_HELIUS_SENDER', '').lower() == 'true'
+        if self.config.use_helius_sender:
+            self.config.enable_jito_bundles = False
         self.price_service = PriceService()
         self.tax_db = TaxDatabase()
         
@@ -733,6 +738,8 @@ class LiveTradingEngine:
         logger.info(f"   Position size: {self.config.position_size_sol} SOL")
         logger.info(f"   Max positions: {self.config.max_open_positions}")
         logger.info(f"   Jito bundles: {'ENABLED' if self.config.enable_jito_bundles else 'DISABLED'}")
+        if self.config.use_helius_sender:
+            logger.info("   Helius sender: ENABLED")
     
     def get_sol_balance(self) -> float:
         """Get current SOL balance"""
@@ -865,6 +872,7 @@ class LiveTradingEngine:
             # Simple connectivity test to Jito
             resp = requests.get(
                 f"{JITO_BLOCK_ENGINE_URL}/api/v1/bundles",
+                f"{JITO_BLOCK_ENGINE_URLS[0]}/api/v1/bundles",
                 timeout=10
             )
             # Even if we get an error response, connectivity is working
@@ -1394,6 +1402,8 @@ class LiveTradingEngine:
     
     def _execute_via_rpc(self, swap_tx_base64: str) -> Optional[str]:
         """Execute transaction via regular RPC"""
+        if self.config.use_helius_sender:
+            return self._execute_via_helius_sender(swap_tx_base64)
         try:
             # Decode and sign
             tx_bytes = base64.b64decode(swap_tx_base64)
@@ -1411,6 +1421,47 @@ class LiveTradingEngine:
         
         return None
     
+    def _execute_via_helius_sender(self, swap_tx_base64: str) -> Optional[str]:
+        """Execute transaction via Helius sender (priority header)."""
+        if not self.rpc_url:
+            logger.error("Helius sender unavailable: RPC URL not configured")
+            return None
+        try:
+            tx_bytes = base64.b64decode(swap_tx_base64)
+            tx = VersionedTransaction.from_bytes(tx_bytes)
+            tx = self._sign_versioned_transaction(tx)
+            tx_base64 = base64.b64encode(bytes(tx)).decode("utf-8")
+
+            header_name = get_secret("HELIUS_PRIORITY_HEADER", "x-helius-priority")
+            header_value = get_secret("HELIUS_PRIORITY_VALUE", "true")
+
+            payload = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "sendTransaction",
+                "params": [
+                    tx_base64,
+                    {"encoding": "base64", "skipPreflight": False}
+                ]
+            }
+            headers = {
+                "Content-Type": "application/json",
+                header_name: header_value
+            }
+
+            resp = requests.post(self.rpc_url, json=payload, headers=headers, timeout=30)
+            if resp.status_code != 200:
+                logger.error(f"Helius sender HTTP error: {resp.status_code} - {resp.text[:200]}")
+                return None
+            result = resp.json()
+            if "result" in result:
+                return str(result["result"])
+            logger.error(f"Helius sender error: {result.get('error')}")
+        except Exception as e:
+            logger.error(f"Helius sender execution error: {e}")
+
+        return None
+
     def _sign_versioned_transaction(self, tx: VersionedTransaction) -> VersionedTransaction:
         """Sign a VersionedTransaction across solders API variants."""
         if hasattr(tx, "sign"):
