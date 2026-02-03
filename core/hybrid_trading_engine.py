@@ -392,6 +392,12 @@ class HybridTradingEngine:
     
     def _execute_paper_trade(self, signal: Dict, wallet_data: Dict = None) -> Dict:
         """Execute paper trade"""
+        if hasattr(self.paper_engine, 'process_signal'):
+            paper_result = self.paper_engine.process_signal(signal, wallet_data)
+            if isinstance(paper_result, dict):
+                paper_result.setdefault('success', bool(paper_result.get('position_id')))
+            return paper_result
+    
         # Build paper signal with our exit parameters
         paper_signal = {
             **signal,
