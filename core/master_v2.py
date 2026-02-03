@@ -1564,7 +1564,12 @@ def background_tasks():
                 if hours_since >= CONFIG.discovery_interval_hours:
                     last_discovery = now
                     print(f"\n🔍 Running discovery...")
-                    trading_system.run_discovery()
+                    discovery_result = trading_system.run_discovery()
+                    if discovery_result:
+                        status = discovery_result.get('status', 'ok')
+                        wallets_added = discovery_result.get('wallets_added', 0)
+                        calls_made = discovery_result.get('api_calls_made', 'n/a')
+                        print(f"🔍 Discovery summary: {status} | Wallets added: {wallets_added} | API calls: {calls_made}")
             
             # Learning (every 6 hours)
             if trading_system.paper_engine:
@@ -1575,6 +1580,15 @@ def background_tasks():
                         force=True, 
                         notifier=trading_system.notifier
                     )
+                    if learning_result:
+                        status = learning_result.get('status', 'unknown')
+                        overall = learning_result.get('overall', {})
+                        win_rate = overall.get('win_rate')
+                        total_pnl = overall.get('total_pnl')
+                        if win_rate is not None and total_pnl is not None:
+                            print(f"🧠 Learning summary: {status} | WR: {win_rate:.1%} | PnL: {total_pnl:+.4f} SOL")
+                        else:
+                            print(f"🧠 Learning summary: {status}")
                     
                     # After learning, run wallet cleanup (actually remove poor performers)
                     if learning_result.get('status') == 'completed':
@@ -1610,6 +1624,11 @@ def background_tasks():
                                     trading_system.hybrid_engine.record_exit(True, pnl, is_win)
                                     trading_system.diagnostics.live_trades_closed += 1
                                     trading_system.diagnostics.live_pnl_sol += pnl
+                                    print(
+                                        f"🔴 LIVE EXIT: {exit.get('token_symbol', 'UNKNOWN')} | "
+                                        f"Reason: {exit.get('exit_reason')} | "
+                                        f"PnL: {pnl:+.4f} SOL ({exit.get('pnl_pct', 0):+.1f}%)"
+                                    )
                                     
                                     if trading_system.notifier:
                                         emoji = "✅" if is_win else "❌"
