@@ -380,6 +380,9 @@ class HybridTradingEngine:
                     # Log comparison if both executed
                     if result['paper_result'] and live_result:
                         self._log_comparison(result['paper_result'], live_result)
+                    elif live_result and not live_result.get('success'):
+                        reason = live_result.get('reason') or live_result.get('error') or 'unknown'
+                        logger.info(f"🔴 Live trade failed: {token_symbol} | {reason}")
                         
                 except Exception as e:
                     logger.error(f"Live trade error: {e}")
@@ -458,9 +461,23 @@ class HybridTradingEngine:
     
     def _log_comparison(self, paper: Dict, live: Dict):
         """Log comparison between paper and live execution"""
+        def _format_result(result: Dict) -> str:
+            if result.get('success'):
+                return "✅"
+            if result.get('skipped'):
+                reason = result.get('reason', 'skipped')
+                return f"⚠️ ({reason})"
+            reason = (
+                result.get('filter_reason')
+                or result.get('reason')
+                or result.get('error')
+                or "failed"
+            )
+            return f"❌ ({reason})"
+
         logger.info(f"📊 Trade Comparison:")
-        logger.info(f"   Paper: {'✅' if paper.get('success') else '❌'}")
-        logger.info(f"   Live:  {'✅' if live.get('success') else '❌'}")
+        logger.info(f"   Paper: {_format_result(paper)}")
+        logger.info(f"   Live:  {_format_result(live)}")
     
     def record_exit(self, is_live: bool, pnl_sol: float, is_win: bool):
         """Record an exit for tracking"""
