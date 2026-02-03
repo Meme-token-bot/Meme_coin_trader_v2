@@ -63,6 +63,9 @@ try:
     from solders.instruction import Instruction, CompiledInstruction, AccountMeta
     from solana.rpc.api import Client as SolanaClient
     from solana.rpc.commitment import Confirmed
+    from solders.system_program import TransferParams, transfer
+    from solders.message import Message
+    from solders.transaction import Transaction
     SOLANA_AVAILABLE = True
 except ImportError:
     SOLANA_AVAILABLE = False
@@ -1103,7 +1106,19 @@ class LiveTradingEngine:
                 return result
             
             # Execute
-            if self.config.enable_jito_bundles and self.jito:
+            if self.config.use_helius_sender:
+                try:
+                    tx_bytes = base64.b64decode(swap_tx)
+                    tx = Transaction.from_bytes(tx_bytes)
+                    tx = self._inject_helius_tip(tx)
+                except Exception:
+                    tx = VersionedTransaction.from_bytes(tx_bytes)
+                    tx = self._build_legacy_from_versioned(tx)
+                tx.sign([self.keypair], tx.message.recent_blockhash)
+                signature = self._execute_via_helius_sender(
+                    base64.b64encode(bytes(tx)).decode("utf-8")
+                )
+            elif self.config.enable_jito_bundles and self.jito:
                 signature = self._execute_via_jito(swap_tx)
             else:
                 signature = self._execute_via_rpc(swap_tx)
@@ -1208,11 +1223,16 @@ class LiveTradingEngine:
             token_symbol = pos.get('token_symbol', 'UNKNOWN')
             entry_price = pos.get('entry_price_usd', 0)
             peak_price = pos.get('peak_price_usd', entry_price)
+            entry_time = datetime.fromisoformat(pos.get('entry_time', '').replace('Z', '+00:00'))
+            hours_held = (datetime.now(timezone.utc) - entry_time).total_seconds() / 3600
             
             # Get current price
             current_price = self.price_service.get_token_price(token_address)
             
             if not current_price or not entry_price:
+                if hours_held >= self.config.max_hold_hours:
+                    result = self.execute_sell(token_address, 'TIME_STOP')
+                    exits.append(result)
                 continue
             
             # Update peak price
@@ -1241,8 +1261,6 @@ class LiveTradingEngine:
                     exit_reason = 'TRAILING_STOP'
             
             # Time stop
-            entry_time = datetime.fromisoformat(pos.get('entry_time', '').replace('Z', '+00:00'))
-            hours_held = (datetime.now(timezone.utc) - entry_time).total_seconds() / 3600
             if hours_held >= self.config.max_hold_hours:
                 exit_reason = 'TIME_STOP'
             
@@ -1494,9 +1512,42 @@ class LiveTradingEngine:
         if not hasattr(message, "instructions"):
             raise ValueError("Helius tip injection requires legacy transaction message")
 
+        instructions, payer, recent_blockhash = self._compiled_to_instructions(message)
+        instructions.append(self._build_helius_tip_instruction())
+
+        new_message = Message.new_with_blockhash(
+            instructions,
+            payer,
+            recent_blockhash
+        )
+        return Transaction.new_unsigned(new_message)
+
+    def _build_legacy_from_versioned(self, tx: VersionedTransaction) -> Transaction:
+        """Rebuild a legacy transaction from a versioned message plus Helius tip."""
+        message = tx.message
+        instructions, payer, recent_blockhash = self._compiled_to_instructions(message)
+        instructions.append(self._build_helius_tip_instruction())
+        new_message = Message.new_with_blockhash(
+            instructions,
+            payer,
+            recent_blockhash
+        )
+        return Transaction.new_unsigned(new_message)
+
+    def _build_helius_tip_instruction(self) -> Instruction:
+        tip_pubkey = Pubkey.from_string(random.choice(HELIUS_TIP_ACCOUNTS))
+        tip_lamports = max(self.config.jito_tip_lamports, 200_000)
+        return transfer(
+            TransferParams(
+                from_pubkey=self.keypair.pubkey(),
+                to_pubkey=tip_pubkey,
+                lamports=tip_lamports
+            )
+        )
+
+    def _compiled_to_instructions(self, message) -> Tuple[List[Instruction], Pubkey, Hash]:
         account_keys = list(message.account_keys)
         payer = account_keys[0]
-        instructions = []
         header = message.header
         num_required = header.num_required_signatures
         num_readonly_signed = getattr(header, "num_readonly_signed", None)
@@ -1508,6 +1559,7 @@ class LiveTradingEngine:
         writable_signed_cutoff = num_required - num_readonly_signed
         writable_unsigned_cutoff = len(account_keys) - num_readonly_unsigned
 
+        instructions = []
         for compiled in message.instructions:
             program_id = account_keys[compiled.program_id_index]
             accounts = [
@@ -1520,23 +1572,7 @@ class LiveTradingEngine:
             ]
             instructions.append(Instruction(program_id, compiled.data, accounts))
 
-        tip_pubkey = Pubkey.from_string(random.choice(HELIUS_TIP_ACCOUNTS))
-        tip_lamports = max(self.config.jito_tip_lamports, 200_000)
-        tip_instruction = transfer(
-            TransferParams(
-                from_pubkey=self.keypair.pubkey(),
-                to_pubkey=tip_pubkey,
-                lamports=tip_lamports
-            )
-        )
-        instructions.append(tip_instruction)
-
-        new_message = Message.new_with_blockhash(
-            instructions,
-            payer,
-            message.recent_blockhash
-        )
-        return Transaction.new_unsigned(new_message)
+        return instructions, payer, message.recent_blockhash
 
     def _sign_versioned_transaction(self, tx: VersionedTransaction) -> VersionedTransaction:
         """Sign a VersionedTransaction across solders API variants."""
