@@ -1109,15 +1109,19 @@ class LiveTradingEngine:
             if self.config.use_helius_sender:
                 try:
                     tx_bytes = base64.b64decode(swap_tx)
-                    tx = Transaction.from_bytes(tx_bytes)
-                    tx = self._inject_helius_tip(tx)
-                except Exception:
-                    tx = VersionedTransaction.from_bytes(tx_bytes)
-                    tx = self._build_legacy_from_versioned(tx)
-                tx.sign([self.keypair], tx.message.recent_blockhash)
-                signature = self._execute_via_helius_sender(
-                    base64.b64encode(bytes(tx)).decode("utf-8")
-                )
+                    try:
+                        legacy_tx = Transaction.from_bytes(tx_bytes)
+                        legacy_tx = self._inject_helius_tip(legacy_tx)
+                    except Exception:
+                        versioned_tx = VersionedTransaction.from_bytes(tx_bytes)
+                        legacy_tx = self._build_legacy_from_versioned(versioned_tx)
+                    legacy_tx.sign([self.keypair], legacy_tx.message.recent_blockhash)
+                    signature = self._execute_via_helius_sender(
+                        base64.b64encode(bytes(legacy_tx)).decode("utf-8")
+                    )
+                except Exception as e:
+                    logger.error(f"Helius exit conversion failed: {e}")
+                    signature = None
             elif self.config.enable_jito_bundles and self.jito:
                 signature = self._execute_via_jito(swap_tx)
             else:
