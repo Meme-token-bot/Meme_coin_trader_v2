@@ -77,8 +77,10 @@ SOL_MINT = "So11111111111111111111111111111111111111112"
 LAMPORTS_PER_SOL = 1_000_000_000
 
 # API Endpoints
-JUPITER_QUOTE_URL = "https://public.jupiterapi.com/quote"
-JUPITER_SWAP_URL = "https://public.jupiterapi.com/swap"
+DEFAULT_JUPITER_QUOTE_URL = os.getenv("JUPITER_QUOTE_URL", "https://public.jupiterapi.com/quote")
+DEFAULT_JUPITER_SWAP_URL = os.getenv("JUPITER_SWAP_URL", "https://public.jupiterapi.com/swap")
+JUPITER_QUOTE_URL_FALLBACK = "https://api.jup.ag/v6/quote"
+JUPITER_SWAP_URL_FALLBACK = "https://api.jup.ag/v6/swap"
 JUPITER_PRICE_URL = "https://api.jup.ag/price/v2/full"
 
 # Jito endpoints
