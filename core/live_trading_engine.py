@@ -101,6 +101,18 @@ JITO_TIP_ACCOUNTS = [
     "DttWaMuVvTiduZRnguLF7jNxTgiMBZ1hyAumKUiL2KRL",
     "3AVi9Tg9Uo68tJfuvoKvqKNWKkC5wPdSSdeBnizKZ6jT"
 ]
+HELIUS_TIP_ACCOUNTS = [
+    "4ACfpUFoaSD9bfPdeu6DBt89gB6ENTeHBXCAi87NhDEE",
+    "D2L6yPZ2FmmmTKPgzaMKdhu6EWZcTpLy1Vhx8uvZe7NZ",
+    "9bnz4RShgq1hAnLnZbP8kbgBg1kEmcJBYQq3gQbmnSta",
+    "5VY91ws6B2hMmBFRsXkoAAdsPHBJwRfBht4DXox3xkwn",
+    "2nyhqdwKcJZR2vcqCyrYsaPVdAnFoJjiksCXJ7hfEYgD",
+    "2q5pghRs6arqVjRvT5gfgWfWcHWmw1ZuCzphgd5KfWGJ",
+    "wyvPkWjVZz1M8fHQnMMCDTQDbkManefNNhweYk5WkcF",
+    "3KCKozbAaF75qEU33jtzozcJ29yJuaLJTy2jFdzUY8bT",
+    "4vieeGHPYPG2MmyPRcYjdiDmmhN3ww7hsFNap8pVN3Ey",
+    "4TQLFNWK8AovT1gFvda5jfw2oJeRMKEmw7aH6MGBJ3or"
+]
 
 # Price APIs
 COINGECKO_URL = "https://api.coingecko.com/api/v3/simple/price"
@@ -1423,14 +1435,25 @@ class LiveTradingEngine:
     
     def _execute_via_helius_sender(self, swap_tx_base64: str) -> Optional[str]:
         """Execute transaction via Helius sender (priority header)."""
-        if not self.rpc_url:
+        sender_url = get_secret("HELIUS_SENDER_URL")
+        if not sender_url:
+            helius_key = get_secret("HELIUS_KEY")
+            if helius_key:
+                sender_url = f"https://sender.helius-rpc.com/fast?api-key={helius_key}"
+        if not sender_url:
             logger.error("Helius sender unavailable: RPC URL not configured")
             return None
         try:
             tx_bytes = base64.b64decode(swap_tx_base64)
-            tx = VersionedTransaction.from_bytes(tx_bytes)
-            tx = self._sign_versioned_transaction(tx)
-            tx_base64 = base64.b64encode(bytes(tx)).decode("utf-8")
+            try:
+                tx = Transaction.from_bytes(tx_bytes)
+                tx = self._inject_helius_tip(tx)
+                tx.sign([self.keypair], tx.message.recent_blockhash)
+                tx_base64 = base64.b64encode(bytes(tx)).decode("utf-8")
+            except Exception:
+                tx = VersionedTransaction.from_bytes(tx_bytes)
+                tx = self._sign_versioned_transaction(tx)
+                tx_base64 = base64.b64encode(bytes(tx)).decode("utf-8")
 
             header_name = get_secret("HELIUS_PRIORITY_HEADER", "x-helius-priority")
             header_value = get_secret("HELIUS_PRIORITY_VALUE", "true")
@@ -1441,7 +1464,7 @@ class LiveTradingEngine:
                 "method": "sendTransaction",
                 "params": [
                     tx_base64,
-                    {"encoding": "base64", "skipPreflight": False}
+                    {"encoding": "base64", "skipPreflight": True, "maxRetries": 0}
                 ]
             }
             headers = {
@@ -1449,7 +1472,7 @@ class LiveTradingEngine:
                 header_name: header_value
             }
 
-            resp = requests.post(self.rpc_url, json=payload, headers=headers, timeout=30)
+            resp = requests.post(sender_url, json=payload, headers=headers, timeout=30)
             if resp.status_code != 200:
                 logger.error(f"Helius sender HTTP error: {resp.status_code} - {resp.text[:200]}")
                 return None
@@ -1461,6 +1484,38 @@ class LiveTradingEngine:
             logger.error(f"Helius sender execution error: {e}")
 
         return None
+
+    def _inject_helius_tip(self, tx: Transaction) -> Transaction:
+        """Inject mandatory Helius tip into a legacy transaction."""
+        message = tx.message
+        if not hasattr(message, "instructions"):
+            raise ValueError("Helius tip injection requires legacy transaction message")
+
+        account_keys = list(message.account_keys)
+        payer = account_keys[0]
+        instructions = []
+        for compiled in message.instructions:
+            program_id = account_keys[compiled.program_id_index]
+            accounts = [account_keys[i] for i in compiled.accounts]
+            instructions.append(Instruction(program_id, compiled.data, accounts))
+
+        tip_pubkey = Pubkey.from_string(random.choice(HELIUS_TIP_ACCOUNTS))
+        tip_lamports = max(self.config.jito_tip_lamports, 200_000)
+        tip_instruction = transfer(
+            TransferParams(
+                from_pubkey=self.keypair.pubkey(),
+                to_pubkey=tip_pubkey,
+                lamports=tip_lamports
+            )
+        )
+        instructions.append(tip_instruction)
+
+        new_message = Message.new_with_blockhash(
+            instructions,
+            payer,
+            message.recent_blockhash
+        )
+        return Transaction.new_unsigned(new_message)
 
     def _sign_versioned_transaction(self, tx: VersionedTransaction) -> VersionedTransaction:
         """Sign a VersionedTransaction across solders API variants."""
