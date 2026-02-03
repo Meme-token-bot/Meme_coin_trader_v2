@@ -1222,40 +1222,54 @@ class LiveTradingEngine:
     def _get_jupiter_quote(self, input_mint: str, output_mint: str, 
                            amount: int, slippage_bps: int = 100) -> Optional[Dict]:
         """Get a quote from Jupiter"""
-        try:
-            params = {
-                'inputMint': input_mint,
-                'outputMint': output_mint,
-                'amount': str(amount),
-                'slippageBps': slippage_bps
-            }
-            
-            resp = requests.get(JUPITER_QUOTE_URL, params=params, timeout=10)
-            
-            if resp.status_code == 200:
-                return resp.json()
-        except Exception as e:
-            logger.error(f"Jupiter quote error: {e}")
+        params = {
+            'inputMint': input_mint,
+            'outputMint': output_mint,
+            'amount': str(amount),
+            'slippageBps': slippage_bps
+        }
+        metis_url = get_secret('QUICKNODE_METIS_URL')
+        if metis_url:
+            metis_url = metis_url.rstrip('/')
+            quote_url = f"{metis_url}/quote"
+        else:
+            quote_url = DEFAULT_JUPITER_QUOTE_URL
+
+        for url in (quote_url, JUPITER_QUOTE_URL_FALLBACK):
+            try:
+                resp = requests.get(url, params=params, timeout=10)
+                if resp.status_code == 200:
+                    return resp.json()
+                logger.warning(f"Jupiter quote non-200 ({resp.status_code}) from {url}")
+            except Exception as e:
+                logger.error(f"Jupiter quote error via {url}: {e}")
         
         return None
     
     def _get_jupiter_swap(self, quote: Dict) -> Optional[str]:
         """Get swap transaction from Jupiter"""
-        try:
-            payload = {
-                'quoteResponse': quote,
-                'userPublicKey': self.wallet_pubkey,
-                'wrapAndUnwrapSol': True,
-                'prioritizationFeeLamports': self.config.priority_fee_lamports
-            }
-            
-            resp = requests.post(JUPITER_SWAP_URL, json=payload, timeout=30)
-            
-            if resp.status_code == 200:
-                data = resp.json()
-                return data.get('swapTransaction')
-        except Exception as e:
-            logger.error(f"Jupiter swap error: {e}")
+        payload = {
+            'quoteResponse': quote,
+            'userPublicKey': self.wallet_pubkey,
+            'wrapAndUnwrapSol': True,
+            'prioritizationFeeLamports': self.config.priority_fee_lamports
+        }
+        metis_url = get_secret('QUICKNODE_METIS_URL')
+        if metis_url:
+            metis_url = metis_url.rstrip('/')
+            swap_url = f"{metis_url}/swap"
+        else:
+            swap_url = DEFAULT_JUPITER_SWAP_URL
+
+        for url in (swap_url, JUPITER_SWAP_URL_FALLBACK):
+            try:
+                resp = requests.post(url, json=payload, timeout=30)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    return data.get('swapTransaction')
+                logger.warning(f"Jupiter swap non-200 ({resp.status_code}) from {url}")
+            except Exception as e:
+                logger.error(f"Jupiter swap error via {url}: {e}")
         
         return None
     
@@ -1303,7 +1317,7 @@ class LiveTradingEngine:
             tip_tx.sign([self.keypair], recent_blockhash)
             
             # 4. Sign the swap transaction
-            swap_tx.sign([self.keypair])
+            swap_tx = self._sign_versioned_transaction(swap_tx)
             
             # 5. Encode both transactions for the bundle
             signed_swap = base64.b64encode(bytes(swap_tx)).decode('utf-8')
@@ -1368,7 +1382,7 @@ class LiveTradingEngine:
             # Decode and sign
             tx_bytes = base64.b64decode(swap_tx_base64)
             tx = VersionedTransaction.from_bytes(tx_bytes)
-            tx.sign([self.keypair])
+            tx = self._sign_versioned_transaction(tx)
             
             # Send
             resp = self.solana_client.send_transaction(tx)
@@ -1380,6 +1394,13 @@ class LiveTradingEngine:
             logger.error(f"RPC execution error: {e}")
         
         return None
+    
+    def _sign_versioned_transaction(self, tx: VersionedTransaction) -> VersionedTransaction:
+        """Sign a VersionedTransaction across solders API variants."""
+        if hasattr(tx, "sign"):
+            tx.sign([self.keypair])
+            return tx
+        return VersionedTransaction.populate(tx.message, [self.keypair])
     
     def _wait_for_confirmation(self, signature: str, timeout: int = None) -> bool:
         """Wait for transaction confirmation"""
