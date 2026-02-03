@@ -1605,7 +1605,8 @@ class LiveTradingEngine:
                 
                 if statuses and statuses[0]:
                     status = statuses[0]
-                    if status.confirmation_status in ['confirmed', 'finalized']:
+                    conf_status = str(status.confirmation_status)
+                    if 'confirmed' in conf_status.lower() or 'finalized' in conf_status.lower():
                         return status.err is None
                 
                 time.sleep(1)
