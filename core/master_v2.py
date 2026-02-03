@@ -25,7 +25,7 @@ import json
 import threading
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from collections import deque
 
 from flask import Flask, request, jsonify
@@ -637,6 +637,24 @@ class FixedPaperTradingEngine:
             top_wallets=self._top_wallets
         )
     
+    def score_signal(self, signal: Dict, wallet_data: Dict = None) -> Dict:
+        """Calculate conviction/quality without opening a position."""
+        quality = self.quality_analyzer.analyze_signal(signal, wallet_data)
+        quality_score = quality.calculate_composite_score()
+
+        wallet_wr = signal.get('wallet_win_rate', 0.5)
+        if wallet_wr > 1:
+            wallet_wr = wallet_wr / 100.0
+
+        conviction = 50 + (wallet_wr * 30) + (quality_score - 50) * 0.4
+        conviction = max(0, min(100, conviction))
+
+        return {
+            'conviction': conviction,
+            'quality_score': quality_score,
+            'quality_metrics': asdict(quality)
+        }
+    
     def get_open_positions(self) -> List[Dict]:
         return self._trader.get_open_positions()
     
@@ -1037,6 +1055,12 @@ class TradingSystem:
             'win_rate': wallet_wr,
             'cluster': wallet_data.get('cluster', 'UNKNOWN'),
         }
+
+        if self.paper_engine:
+            scored_signal = self.paper_engine.score_signal(signal_data, wallet_info)
+            signal_data['conviction_score'] = scored_signal.get('conviction', 0)
+            signal_data['quality_score'] = scored_signal.get('quality_score', 0)
+            signal_data['quality_metrics'] = scored_signal.get('quality_metrics', {})
         
         # ======================================================================
         # HYBRID TRADING: Route through paper AND live if enabled
