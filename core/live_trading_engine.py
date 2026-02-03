@@ -33,6 +33,7 @@ from contextlib import contextmanager
 import sqlite3
 import requests
 import logging
+import random
 
 # Configure logging
 logging.basicConfig(
@@ -664,8 +665,16 @@ class LiveTradingEngine:
         # Load wallet
         self.keypair = None
         self.wallet_pubkey = None
+
         if private_key is None:
-            private_key = get_secret('SOLANA_PRIVATE_KEY') or get_secret('HOT_WALLET_1')
+            hot_wallet_keys = [
+                get_secret(f'HOT_WALLET_{i}') for i in range(1, 6)
+            ]
+            hot_wallet_keys = [key for key in hot_wallet_keys if key]
+            if hot_wallet_keys:
+                private_key = random.choice(hot_wallet_keys)
+            else:
+                private_key = get_secret('SOLANA_PRIVATE_KEY')
         
         if private_key:
             try:
@@ -771,10 +780,11 @@ class LiveTradingEngine:
             if conviction < self.config.min_conviction:
                 return False, f"Conviction {conviction} < {self.config.min_conviction}"
             
-            liquidity = signal.get('liquidity', 0)
-            if liquidity < self.config.min_liquidity_usd:
-                return False, f"Liquidity ${liquidity:,.0f} < ${self.config.min_liquidity_usd:,.0f}"
-        
+            #liquidity = signal.get('liquidity', 0)
+            #if liquidity < self.config.min_liquidity_usd:
+            #    return False, f"Liquidity ${liquidity:,.0f} < ${self.config.min_liquidity_usd:,.0f}"
+            # Liquidity filter intentionally disabled
+            
         return True, "OK"
     
     def validate_jito_setup(self) -> Tuple[bool, str]:

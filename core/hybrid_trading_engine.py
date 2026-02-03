@@ -212,9 +212,10 @@ class SignalFilter:
             return False, f"Low conviction: {conviction} < {self.config.min_conviction}"
         
         # Check liquidity
-        liquidity = signal.get('liquidity_usd', signal.get('liquidity', 0))
-        if liquidity < self.config.min_liquidity_usd:
-            return False, f"Low liquidity: ${liquidity:,.0f} < ${self.config.min_liquidity_usd:,.0f}"
+        #liquidity = signal.get('liquidity_usd', signal.get('liquidity', 0))
+        #if liquidity < self.config.min_liquidity_usd:
+        #    return False, f"Low liquidity: ${liquidity:,.0f} < ${self.config.min_liquidity_usd:,.0f}"
+        # Liquidity filter intentionally disabled for live trading alignment
         
         # Check wallet win rate
         if wallet_data:
