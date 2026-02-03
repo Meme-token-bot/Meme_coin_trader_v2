@@ -84,8 +84,13 @@ JUPITER_SWAP_URL_FALLBACK = "https://api.jup.ag/v6/swap"
 JUPITER_PRICE_URL = "https://api.jup.ag/price/v2/full"
 
 # Jito endpoints
-JITO_BLOCK_ENGINE_URL = "https://slc.mainnet.block-engine.jito.wtf"
-JITO_BUNDLE_URL = f"{JITO_BLOCK_ENGINE_URL}/api/v1/bundles"
+JITO_BLOCK_ENGINE_URLS = [
+    "https://ny.mainnet.block-engine.jito.wtf",
+    "https://amsterdam.mainnet.block-engine.jito.wtf",
+    "https://frankfurt.mainnet.block-engine.jito.wtf",
+    "https://slc.mainnet.block-engine.jito.wtf"
+]
+JITO_BUNDLE_URLS = [f"{url}/api/v1/bundles" for url in JITO_BLOCK_ENGINE_URLS]
 JITO_TIP_ACCOUNTS = [
     "96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5",
     "HFqU5x63VTqvQss8hp11i4bVmkdzGTbQrWMT7wekGuLt",
@@ -238,6 +243,7 @@ class JitoBundleService:
     def __init__(self, keypair: Keypair):
         self.keypair = keypair
         self._tip_account_index = 0
+        self.last_status_code: Optional[int] = None
     
     def get_tip_account(self) -> str:
         """Rotate through tip accounts for load balancing"""
@@ -267,28 +273,32 @@ class JitoBundleService:
                 "params": [transactions]
             }
             
-            resp = requests.post(
-                JITO_BUNDLE_URL,
-                json=payload,
-                headers={"Content-Type": "application/json"},
-                timeout=30
-            )
-            
-            if resp.status_code == 200:
-                result = resp.json()
-                if 'result' in result:
-                    bundle_id = result['result']
-                    logger.info(f"🚀 Jito bundle accepted: {bundle_id}")
-                    return bundle_id
-                elif 'error' in result:
-                    error_msg = result['error']
-                    logger.error(f"❌ Jito bundle rejected: {error_msg}")
-                    # Common errors:
-                    # - "Bundle contains invalid transactions" - signatures wrong
-                    # - "Bundle too old" - blockhash expired
-                    # - "Insufficient tip" - need higher tip
-            else:
-                logger.error(f"❌ Jito HTTP error: {resp.status_code} - {resp.text[:200]}")
+            for bundle_url in JITO_BUNDLE_URLS:
+                resp = requests.post(
+                    bundle_url,
+                    json=payload,
+                    headers={"Content-Type": "application/json"},
+                    timeout=30
+                )
+                self.last_status_code = resp.status_code
+                
+                if resp.status_code == 200:
+                    result = resp.json()
+                    if 'result' in result:
+                        bundle_id = result['result']
+                        logger.info(f"🚀 Jito bundle accepted: {bundle_id}")
+                        return bundle_id
+                    elif 'error' in result:
+                        error_msg = result['error']
+                        logger.error(f"❌ Jito bundle rejected: {error_msg}")
+                        # Common errors:
+                        # - "Bundle contains invalid transactions" - signatures wrong
+                        # - "Bundle too old" - blockhash expired
+                        # - "Insufficient tip" - need higher tip
+                else:
+                    logger.error(
+                        f"❌ Jito HTTP error: {resp.status_code} - {resp.text[:200]}"
+                    )
         
         except requests.exceptions.Timeout:
             logger.error("⏱️ Jito request timed out")
@@ -312,24 +322,25 @@ class JitoBundleService:
                 "params": [[bundle_id]]
             }
             
-            resp = requests.post(
-                JITO_BUNDLE_URL,
-                json=payload,
-                headers={"Content-Type": "application/json"},
-                timeout=10
-            )
-            
-            if resp.status_code == 200:
-                result = resp.json()
-                statuses = result.get('result', {}).get('value', [])
-                if statuses and len(statuses) > 0:
-                    bundle_status = statuses[0]
-                    if bundle_status:
-                        # Jito returns confirmation_status or status
-                        status = bundle_status.get('confirmation_status') or bundle_status.get('status')
-                        if status:
-                            logger.debug(f"Bundle {bundle_id[:8]}... status: {status}")
-                            return status.lower()
+            for bundle_url in JITO_BUNDLE_URLS:
+                resp = requests.post(
+                    bundle_url,
+                    json=payload,
+                    headers={"Content-Type": "application/json"},
+                    timeout=10
+                )
+                
+                if resp.status_code == 200:
+                    result = resp.json()
+                    statuses = result.get('result', {}).get('value', [])
+                    if statuses and len(statuses) > 0:
+                        bundle_status = statuses[0]
+                        if bundle_status:
+                            # Jito returns confirmation_status or status
+                            status = bundle_status.get('confirmation_status') or bundle_status.get('status')
+                            if status:
+                                logger.debug(f"Bundle {bundle_id[:8]}... status: {status}")
+                                return status.lower()
         except Exception as e:
             logger.warning(f"Bundle status check failed: {e}")
         
@@ -1365,6 +1376,9 @@ class LiveTradingEngine:
             
             # Bundle submission failed
             logger.error("❌ Failed to submit Jito bundle")
+            if getattr(self.jito, "last_status_code", None) == 429:
+                logger.warning("⚠️ Jito rate limited (429). Falling back to RPC execution.")
+                return self._execute_via_rpc(swap_tx_base64)
             return None
             
         except Exception as e:
