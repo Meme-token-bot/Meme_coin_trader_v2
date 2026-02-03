@@ -81,8 +81,8 @@ TIP_ACCOUNTS = [
 ]
 
 # Jupiter API endpoints
-JUPITER_QUOTE_URL = "https://quote-api.jup.ag/v6/quote"
-JUPITER_SWAP_URL = "https://quote-api.jup.ag/v6/swap"
+JUPITER_QUOTE_URL = "https://public.jupiterapi.com/quote"
+JUPITER_SWAP_URL = "https://public.jupiterapi.com/swap"
 
 # CoinGecko for prices
 COINGECKO_URL = "https://api.coingecko.com/api/v3/simple/price"
@@ -1121,7 +1121,7 @@ Your wallet tokens:
     
     # List all tokens
     if args.list:
-        list_wallet_tokens(engine, debug=getattr(args, 'debug', False))
+        list_wallet_tokens(engine)
         return
     
     # Resolve token mint address
