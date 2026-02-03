@@ -656,6 +656,8 @@ class LiveTradingEngine:
                  config: LiveTradingConfig = None):
         
         self.config = config or LiveTradingConfig()
+        if not self.config.enable_live_trading:
+            self.config.enable_live_trading = get_secret('ENABLE_LIVE_TRADING', '').lower() == 'true'
         self.price_service = PriceService()
         self.tax_db = TaxDatabase()
         
