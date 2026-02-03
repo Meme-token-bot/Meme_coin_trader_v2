@@ -109,7 +109,7 @@ class LiveTradingConfig:
     
     # Capital management
     starting_capital_sol: float = 3.0
-    position_size_sol: float = 0.08          # Per trade
+    position_size_sol: float = 0.30          # Per trade
     max_open_positions: int = 10             # Max concurrent
     max_deployed_sol: float = 0.80           # Max SOL in positions
     fee_reserve_sol: float = 0.30            # Reserved for fees

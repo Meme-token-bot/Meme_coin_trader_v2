@@ -980,8 +980,7 @@ class TradingSystem:
         return None
     
     def _process_buy(self, trade: Dict, wallet_data: Dict, token_addr: str, signature: str) -> Dict:
-        # Use stealth coordinator instead of single wallet
-        result = self.stealth.execute_buy(signal)
+        result = {"action": "NONE", "success": False}
         
         if self.db.is_position_tracked(wallet_data['address'], token_addr):
             result['reason'] = 'Position already tracked'
