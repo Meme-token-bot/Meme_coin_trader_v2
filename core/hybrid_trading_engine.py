@@ -444,8 +444,8 @@ class HybridTradingEngine:
         
         return {'success': False, 'error': 'Paper engine not configured properly'}
     
-    def _execute_live_trade(self, signal: Dict, wallet_data: Dict = None) -> Dict:
-        """Execute live trade"""
+    def _execute_live_trade(self, signal: Dict, wallet_data: Dict = None):# -> Dict:
+        """Execute live trade with safe dict access"""
         live_signal = {
             'action': 'BUY',
             'token_address': signal.get('token_address', signal.get('token_out', '')),
@@ -463,8 +463,8 @@ class HybridTradingEngine:
         if hasattr(self.live_engine, 'execute_buy'):
             result = self.live_engine.execute_buy(live_signal)
             
-            if result.get('success'):
-                # Send notification
+            # SAFE ACCESS - don't assume keys exist
+            if result and result.get('success'):
                 if self.notifier:
                     self.notifier.send(
                         f"🟢 LIVE BUY: {live_signal['token_symbol']}\n"
@@ -472,7 +472,7 @@ class HybridTradingEngine:
                         f"Sig: {result.get('signature', 'N/A')[:16]}..."
                     )
             
-            return result
+            return result or {'success': False, 'error': 'No result from execute_buy'}
         
         return {'success': False, 'error': 'Live engine not configured properly'}
     
@@ -517,6 +517,21 @@ class HybridTradingEngine:
                     self.live_engine.execute_sell(pos['token_address'], 'KILL_SWITCH')
                 except Exception as e:
                     logger.error(f"Failed to close {pos.get('token_symbol')}: {e}")
+    
+    def get_stats(self):
+        """Get current day stats - ALL KEYS GUARANTEED"""
+        with self._lock:
+            self._check_date()
+            return {
+                'date': self._today,
+                'trades': self._trades,
+                'wins': self._wins,
+                'losses': self._losses,
+                'win_rate': self._wins / self._trades if self._trades > 0 else 0,
+                'pnl_sol': self._pnl_sol,  # MUST exist
+                'consecutive_losses': self._consecutive_losses,
+                'in_cool_down': self.is_in_cool_down()
+            }
     
     def get_status(self) -> Dict:
         """Get comprehensive status"""

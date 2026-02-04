@@ -370,7 +370,7 @@ Sig: <code>{sig_display}</code>"""
 # FIXED PAPER TRADING ENGINE WRAPPER
 # ============================================================================
 class FixedPaperTradingEngine:
-    """Wrapper around RobustPaperTrader for master_v2.py compatibility"""
+    '''Wrapper around RobustPaperTrader for master_v2.py compatibility'''
     
     def __init__(self, db, starting_balance: float = 10.0, max_positions: int = 5):
         self.db = db
@@ -380,7 +380,6 @@ class FixedPaperTradingEngine:
             db_path="robust_paper_trades_v6.db",
             starting_balance=starting_balance,
             max_open_positions=max_positions
-            #enable_background_monitoring=True
         )
         
         # Quality analyzer for signal scoring
@@ -407,48 +406,30 @@ class FixedPaperTradingEngine:
         return self._trader.can_open_position(signal)
     
     def process_signal(self, signal: Dict, wallet_data: Dict = None) -> Dict:
-        """Process signal - interface for HybridTradingEngine."""
-        price = signal.get('price_usd', signal.get('price', 0))
-        if price <= 0:
-            return {'success': False, 'error': 'Invalid price'}
+        '''
+        Process signal - interface for HybridTradingEngine.
         
-        decision = {
-            'conviction': signal.get('conviction_score', signal.get('conviction', 50)),
-            'conviction_score': signal.get('conviction_score', signal.get('conviction', 50)),
-            'stop_loss': signal.get('stop_loss_pct', -15.0),
-            'take_profit': signal.get('take_profit_pct', 30.0),
-            'trailing_stop': signal.get('trailing_stop_pct', 10.0),
-            'reason': signal.get('reason', ''),
-        }
+        FIXED: Delegate to RobustPaperTrader.process_signal() which handles
+        everything correctly.
+        '''
+        # Ensure price is in the signal
+        if 'price' not in signal:
+            signal['price'] = signal.get('price_usd', 0)
         
-        position_id = self.open_position(signal, decision, price)
+        # RobustPaperTrader.process_signal() does all the work
+        result = self._trader.process_signal(signal, wallet_data)
         
-        return {
-            'success': position_id is not None,
-            'position_id': position_id,
-            'conviction': decision['conviction'],
-        }
-
+        # Ensure 'success' key exists for HybridTradingEngine
+        if 'success' not in result:
+            result['success'] = result.get('position_id') is not None
+        
+        return result
     
     def open_position(self, signal: Dict, decision: Dict, price: float) -> Optional[int]:
-        """Open a paper position"""
-        # Build entry context
-        context = {
-            'token_address': signal.get('token_address', signal.get('token_out', '')),
-            'token_symbol': signal.get('token_symbol', 'UNKNOWN'),
-            'entry_price_usd': price,
-            'wallet_address': signal.get('wallet_address', signal.get('fee_payer', '')),
-            'conviction_score': decision.get('conviction', signal.get('conviction_score', 50)),
-            'signal_source': signal.get('signal_type', 'COPY'),
-            'wallet_win_rate': signal.get('wallet_win_rate', 0.5),
-            'liquidity_usd': signal.get('liquidity_usd', 0),
-            'stop_loss_pct': decision.get('stop_loss', -12.0),
-            'take_profit_pct': decision.get('take_profit', 30.0),
-            'trailing_stop_pct': decision.get('trailing_stop', 8.0),
-        }
-        
-        position_id = self._trader.open_position(context)
-        return position_id
+        '''Open a paper position - calls process_signal internally'''
+        signal_with_price = {**signal, 'price': price, 'price_usd': price}
+        result = self.process_signal(signal_with_price)
+        return result.get('position_id')
     
     def get_open_positions(self) -> List[Dict]:
         return self._trader.get_open_positions()
@@ -468,28 +449,10 @@ class FixedPaperTradingEngine:
             'total_pnl': summary.get('total_pnl_sol', getattr(self._trader, 'total_pnl', 0)),
             'return_pct': summary.get('return_pct', 0),
             'open_positions': summary.get('open_positions', getattr(self._trader, 'open_position_count', 0)),
-            'max_positions': summary.get('max_positions', getattr(self._trader, 'max_open_positions', 0)),
+            'max_positions': summary.get('max_positions', getattr(self._trader, 'max_open_positions', 5)),
             'total_trades': summary.get('total_trades', getattr(self._trader, 'total_trades', 0)),
-            'win_rate': summary.get('win_rate', 0),
+            'winning_trades': summary.get('winning_trades', getattr(self._trader, 'winning_trades', 0)),
         }
-    
-    def get_full_status(self) -> Dict:
-        return {
-            'summary': self.get_stats(),
-            'baseline': self.get_baseline_comparison() if self.baseline_tracker else {},
-        }
-    
-    def get_baseline_comparison(self) -> Dict:
-        if self.baseline_tracker:
-            return self.baseline_tracker.get_comparison()
-        return {}
-    
-    def print_status(self):
-        self._trader.print_status()
-    
-    def stop(self):
-        self._trader.stop()
-
 
 # ============================================================================
 # TRADING SYSTEM
