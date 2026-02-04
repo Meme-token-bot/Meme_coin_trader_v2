@@ -406,6 +406,30 @@ class FixedPaperTradingEngine:
     def can_open_position(self, signal: Dict = None) -> Tuple[bool, str]:
         return self._trader.can_open_position(signal)
     
+    def process_signal(self, signal: Dict, wallet_data: Dict = None) -> Dict:
+        """Process signal - interface for HybridTradingEngine."""
+        price = signal.get('price_usd', signal.get('price', 0))
+        if price <= 0:
+            return {'success': False, 'error': 'Invalid price'}
+        
+        decision = {
+            'conviction': signal.get('conviction_score', signal.get('conviction', 50)),
+            'conviction_score': signal.get('conviction_score', signal.get('conviction', 50)),
+            'stop_loss': signal.get('stop_loss_pct', -15.0),
+            'take_profit': signal.get('take_profit_pct', 30.0),
+            'trailing_stop': signal.get('trailing_stop_pct', 10.0),
+            'reason': signal.get('reason', ''),
+        }
+        
+        position_id = self.open_position(signal, decision, price)
+        
+        return {
+            'success': position_id is not None,
+            'position_id': position_id,
+            'conviction': decision['conviction'],
+        }
+
+    
     def open_position(self, signal: Dict, decision: Dict, price: float) -> Optional[int]:
         """Open a paper position"""
         # Build entry context

@@ -293,7 +293,7 @@ class HybridTradingEngine:
         
         # Check daily loss limit
         stats = self.daily_stats.get_stats()
-        if stats['pnl_sol'] <= -self.config.max_daily_loss_sol:
+        if stats.get('pnl_sol', 0) <= -self.config.max_daily_loss_sol:
             return False, f"Daily loss limit reached: {stats['pnl_sol']:.4f} SOL"
         
         # Check consecutive losses
