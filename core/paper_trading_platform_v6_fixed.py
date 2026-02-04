@@ -910,6 +910,9 @@ class RobustPaperTrader:
         self.db_path = db_path
         self.starting_balance = starting_balance
         self.max_open_positions = max_open_positions  # NEW: Configurable limit
+        self.enable_watchdog = enable_watchdog
+        self.enable_baseline_tracking = enable_baseline_tracking
+        self.enable_historical_storage = enable_historical_storage
         
         # Core state
         self.balance = starting_balance
@@ -921,6 +924,7 @@ class RobustPaperTrader:
         
         # Callback for exit notifications
         self.on_position_closed = None
+        self._notifier = None
         
         # Thread safety - use RLock for reentrant locking
         self._lock = threading.RLock()
@@ -936,12 +940,12 @@ class RobustPaperTrader:
         self.quality_analyzer = SignalQualityAnalyzer()
         self.exit_calculator = DynamicExitCalculator()
         
-        if enable_baseline_tracking:
+        if self.enable_baseline_tracking:
             self.baseline_tracker = BaselineTracker()
         else:
             self.baseline_tracker = None
         
-        if enable_historical_storage:
+        if self.enable_historical_storage:
             self.historical_store = HistoricalDataStore()
             self.historical_store.start_price_updater()
         else:
@@ -952,11 +956,26 @@ class RobustPaperTrader:
         # Start monitoring
         self.start_monitor()
         
-        if enable_watchdog:
+        if self.enable_watchdog:
             self.watchdog = ExitMonitorWatchdog(self)
             self.watchdog.start()
         else:
             self.watchdog = None
+
+    def set_notifier(self, notifier) -> None:
+        """Attach a notifier for exit alerts."""
+        self._notifier = notifier
+
+        def _exit_callback(result: Dict) -> None:
+            if self._notifier and hasattr(self._notifier, 'send_exit_alert'):
+                self._notifier.send_exit_alert(
+                    {'token_symbol': result.get('token_symbol', 'UNKNOWN')},
+                    result.get('exit_reason', 'UNKNOWN'),
+                    result.get('pnl_pct', 0),
+                    result
+                )
+
+        self.on_position_closed = _exit_callback
         
         print("=" * 60)
         print("🚀 ROBUST PAPER TRADER V6 - FIXED")
@@ -964,10 +983,32 @@ class RobustPaperTrader:
         print(f"   Balance: {self.balance:.4f} SOL")
         print(f"   Open Positions: {self.open_position_count}")
         print(f"   Max Positions: {self.max_open_positions}")  # NEW
-        print(f"   Watchdog: {'ENABLED' if enable_watchdog else 'DISABLED'}")
-        print(f"   Baseline Tracking: {'ENABLED' if enable_baseline_tracking else 'DISABLED'}")
+        print(f"   Watchdog: {'ENABLED' if self.enable_watchdog else 'DISABLED'}")
+        print(f"   Baseline Tracking: {'ENABLED' if self.enable_baseline_tracking else 'DISABLED'}")
         print("=" * 60)
     
+    def set_notifier(self, notifier):
+        self.notifier = notifier
+        if not notifier:
+            self.on_position_closed = None
+            return
+
+        def _notify_on_close(result):
+            token = result.get('token_symbol', 'UNKNOWN')
+            pnl_pct = result.get('pnl_pct', 0.0)
+            pnl_sol = result.get('pnl_sol', 0.0)
+            exit_reason = result.get('exit_reason', 'UNKNOWN')
+            emoji = "✅" if result.get('is_win') else "❌"
+            message = (
+                f"📝 PAPER CLOSE\n\n"
+                f"Token: <b>{token}</b>\n"
+                f"PnL: {pnl_pct:+.1f}% ({pnl_sol:+.4f} SOL)\n"
+                f"Reason: {exit_reason} {emoji}"
+            )
+            notifier.send(message)
+
+        self.on_position_closed = _notify_on_close
+
     def _init_database(self):
         """Initialize the database with fixed schema"""
         with self._get_connection() as conn:
