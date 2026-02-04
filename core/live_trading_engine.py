@@ -808,7 +808,7 @@ class LiveTradingEngine:
         
         # Check daily stats
         daily = self.tax_db.get_daily_stats()
-        if daily['pnl_sol'] <= -self.config.max_daily_loss_sol:
+        if daily.get('pnl_sol', 0) <= -self.config.max_daily_loss_sol:
             return False, f"Daily loss limit reached ({self.config.max_daily_loss_sol} SOL)"
         
         # Check time filters
