@@ -35,6 +35,9 @@ import requests
 import logging
 import random
 
+from core.live_trading_fixes import LiveTradesTaxDB, IntegratedExitMonitor
+from core.token_swap_to_sol import TokenSwapper, SwapConfig
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -693,7 +696,10 @@ class LiveTradingEngine:
         if self.config.use_helius_sender:
             self.config.enable_jito_bundles = False
         self.price_service = PriceService()
-        self.tax_db = TaxDatabase()
+        self.tax_db = LiveTradesTaxDB("live_trades_tax.db")
+        self.swapper = TokenSwapper(SwapConfig(slippage_bps=200))
+        self.exit_monitor = IntegratedExitMonitor(self.tax_db, self.swapper)
+        self.exit_monitor.start(check_interval=30)
         
         # Load wallet
         self.keypair = None
@@ -1012,22 +1018,24 @@ class LiveTradingEngine:
             self.tax_db.record_trade(trade_data)
             
             # Add position
-            position = {
+            position_data = {
                 'token_address': token_address,
                 'token_symbol': token_symbol,
-                'tokens_held': tokens_received,
-                'entry_price_usd': token_price,
+                'entry_timestamp': datetime.now(timezone.utc).isoformat(),
                 'entry_time': datetime.now(timezone.utc).isoformat(),
+                'entry_price_usd': token_price,
+                'tokens_held': tokens_received,
                 'total_cost_sol': sol_amount,
+                'total_cost_usd': total_value_usd,
                 'total_cost_nzd': total_value_nzd,
-                'stop_loss_pct': self.config.stop_loss_pct,
-                'take_profit_pct': self.config.take_profit_pct,
-                'trailing_stop_pct': self.config.trailing_stop_pct,
-                'peak_price_usd': token_price,
                 'entry_signature': signature,
-                'conviction_score': signal.get('conviction_score', 0)
+                'conviction_score': signal.get('conviction_score', 0),
+                'stop_loss_pct': signal.get('stop_loss_pct', self.config.stop_loss_pct),
+                'take_profit_pct': signal.get('take_profit_pct', self.config.take_profit_pct),
+                'trailing_stop_pct': signal.get('trailing_stop_pct', self.config.trailing_stop_pct),
+                'peak_price_usd': token_price,
             }
-            self.tax_db.add_position(position)
+            self.tax_db.add_position(position_data)
             
             # Log success
             self.tax_db.log_execution('BUY', token_address, token_symbol, 'SUCCESS', 

@@ -809,6 +809,13 @@ class TradingSystem:
             self.diagnostics.high_conviction_signals += 1
 
         if decision.get('should_enter'):
+            conviction_score = decision.get('conviction_score', 0)
+            signal['conviction_score'] = conviction_score
+            signal['conviction'] = conviction_score  # Backup key
+            signal['stop_loss_pct'] = decision.get('stop_loss_pct', decision.get('stop_loss', -15.0))
+            signal['take_profit_pct'] = decision.get('take_profit_pct', decision.get('take_profit', 30.0))
+            signal['trailing_stop_pct'] = decision.get('trailing_stop_pct', decision.get('trailing_stop', 10.0))
+            
             result = None
             if self.hybrid_engine:
                 result = self.hybrid_engine.process_signal(signal, wallet_data)
