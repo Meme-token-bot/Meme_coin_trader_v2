@@ -720,10 +720,123 @@ class TradingSystem:
     
     def _process_signal(self, trade: Dict, wallet_data: Dict):
         """Process a trading signal"""
-        # Your existing signal processing logic here
-        # This is where you'd call self.live_integration.process_buy_signal()
-        # for live trading with exit management
-        pass
+        token_transfers = trade.get('token_transfers') or []
+        if not token_transfers:
+            self.diagnostics.parse_failures += 1
+            return
+
+        fee_payer = trade.get('fee_payer')
+        chosen_transfer = None
+
+        for transfer in token_transfers:
+            mint = transfer.get('mint') or transfer.get('tokenAddress')
+            if not mint:
+                continue
+            if self.historian and self.historian.scanner.is_ignored_token(mint):
+                continue
+            if transfer.get('toUserAccount') == fee_payer:
+                chosen_transfer = transfer
+                break
+
+        if not chosen_transfer:
+            for transfer in token_transfers:
+                mint = transfer.get('mint') or transfer.get('tokenAddress')
+                if mint and self.historian and self.historian.scanner.is_ignored_token(mint):
+                    continue
+                chosen_transfer = transfer
+                break
+
+        if not chosen_transfer:
+            self.diagnostics.parse_failures += 1
+            return
+
+        token_address = chosen_transfer.get('mint') or chosen_transfer.get('tokenAddress')
+        if not token_address:
+            self.diagnostics.parse_failures += 1
+            return
+
+        token_info = None
+        if self.historian:
+            if self.rate_limiter.can_call():
+                self.rate_limiter.record_call()
+                self.diagnostics.api_calls_made += 1
+                try:
+                    token_info = self.historian.scanner.get_token_info(token_address)
+                except Exception:
+                    self.diagnostics.api_errors += 1
+            else:
+                self.diagnostics.webhooks_skipped += 1
+                return
+
+        if not token_info:
+            self.diagnostics.token_info_failures += 1
+            return
+
+        token_symbol = (
+            token_info.get('symbol')
+            or chosen_transfer.get('tokenSymbol')
+            or 'UNKNOWN'
+        )
+        price = token_info.get('price_usd', 0) or token_info.get('price_native', 0)
+        if price <= 0:
+            self.diagnostics.parse_failures += 1
+            return
+
+        signal = {
+            'token_address': token_address,
+            'token_symbol': token_symbol,
+            'price': price,
+            'price_usd': price,
+            'liquidity': token_info.get('liquidity', 0),
+            'volume_24h': token_info.get('volume_24h', 0),
+            'token_age_hours': token_info.get('age_hours', 0),
+            'wallet_address': wallet_data.get('address', fee_payer),
+            'wallet_win_rate': wallet_data.get('win_rate', 0.5),
+            'wallet_roi_7d': wallet_data.get('roi_7d', 0),
+            'signal_type': 'COPY',
+            'signature': trade.get('signature'),
+            'timestamp': trade.get('timestamp'),
+        }
+
+        decision = self.strategist.analyze_signal(signal, wallet_data)
+        if decision.get('llm_called'):
+            self.diagnostics.llm_calls += 1
+
+        self.diagnostics.buy_signals_detected += 1
+        if decision.get('conviction_score', 0) >= 80:
+            self.diagnostics.high_conviction_signals += 1
+
+        if decision.get('should_enter'):
+            result = None
+            if self.hybrid_engine:
+                result = self.hybrid_engine.process_signal(signal, wallet_data)
+            elif self.paper_engine:
+                result = self.paper_engine.process_signal(signal, wallet_data)
+
+            paper_result = None
+            if isinstance(result, dict) and 'paper_result' in result:
+                paper_result = result.get('paper_result')
+            elif isinstance(result, dict):
+                paper_result = result
+
+            if paper_result:
+                if paper_result.get('position_id') or paper_result.get('success'):
+                    self.diagnostics.positions_opened += 1
+                if paper_result.get('filter_reason', '').startswith("Position"):
+                    self.diagnostics.position_limit_skips += 1
+                if paper_result.get('quality_metrics', {}).get('is_cluster_signal'):
+                    self.diagnostics.cluster_signals_detected += 1
+
+            live_result = result.get('live_result') if isinstance(result, dict) else None
+            if live_result and live_result.get('success'):
+                self.diagnostics.live_trades_opened += 1
+
+        self.db.mark_signature_processed(
+            trade.get('signature'),
+            wallet=wallet_data.get('address', fee_payer),
+            trade_type='BUY',
+            token=token_address,
+        )
 
 
 # ============================================================================
