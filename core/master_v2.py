@@ -125,7 +125,7 @@ class MasterConfig:
     max_api_calls_per_hour: int = 500
     paper_trading_enabled: bool = True
     paper_starting_balance: float = 10.0
-    use_llm: bool = True
+    use_llm: bool = False
     
     # Position limit - adjust based on phase:
     # Learning mode: 100+ (gather lots of data)
@@ -490,6 +490,8 @@ class TradingSystem:
         
         self.db = DatabaseV2()
         self.strategist = Strategist(self.db, self.anthropic_key)
+        if not CONFIG.use_llm:
+            self.strategist.reasoning_agent.enabled = False
         
         self.notifier = Notifier()
         print(f"  {'✅' if self.notifier.enabled else '⚠️'} Telegram: {'enabled' if self.notifier.enabled else 'disabled'}")
