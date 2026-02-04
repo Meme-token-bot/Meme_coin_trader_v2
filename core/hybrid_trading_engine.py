@@ -358,6 +358,22 @@ class HybridTradingEngine:
         result['filter_reason'] = filter_reason
         
         if not filter_passed:
+            if filter_reason.startswith("Blocked hour"):
+                logger.info(f"⏭️ Live signal blocked: {token_symbol} | {filter_reason}")
+
+                # Still allow paper trades during blocked hours for learning.
+                if self.config.enable_paper_trading and self.paper_engine:
+                    try:
+                        paper_result = self._execute_paper_trade(signal, wallet_data)
+                        result['paper_result'] = paper_result
+                    except Exception as e:
+                        logger.error(f"Paper trade error: {e}")
+
+                if self.config.enable_live_trading and self.live_engine:
+                    result['live_result'] = {'skipped': True, 'reason': filter_reason}
+
+                return result
+            
             logger.info(f"⏭️ Signal filtered: {token_symbol} | {filter_reason}")
             return result
         
