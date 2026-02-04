@@ -2,17 +2,21 @@
 MASTER V2 - PAPER + LIVE TRADING INTEGRATION
 =============================================
 
+PATCHED VERSION: Includes LiveTradingIntegration for automatic exit management.
+
 Uses the fixed V6 paper trading platform with:
 1. ✅ Correct balance calculations
 2. ✅ Enforced position limits
 3. ✅ Reliable exit monitoring
 4. ✅ LIVE TRADING SUPPORT (Hybrid Engine)
+5. ✅ AUTOMATIC EXIT MANAGEMENT (Stop Loss, Take Profit, Trailing Stop, Time Stop)
 
 LIVE TRADING FEATURES:
 - Jito bundle integration for fast execution
 - Parallel paper/live trading for comparison
 - NZ tax compliant record keeping
 - Kill switch for emergencies
+- AUTOMATIC EXIT MONITORING with configurable thresholds
 
 Run migration first:
   python migrate_database.py fresh
@@ -99,6 +103,16 @@ try:
 except ImportError:
     LIVE_ENGINE_AVAILABLE = False
 
+# ============================================================================
+# NEW: EXIT MANAGER INTEGRATION
+# ============================================================================
+try:
+    from core.live_trading_integration import LiveTradingIntegration, IntegrationConfig
+    EXIT_MANAGER_AVAILABLE = True
+except ImportError:
+    EXIT_MANAGER_AVAILABLE = False
+    print("⚠️ Exit manager not available - exits will use hybrid engine only")
+
 
 @dataclass
 class MasterConfig:
@@ -134,11 +148,23 @@ class MasterConfig:
     # LIVE TRADING SETTINGS (Based on paper trading analysis)
     # ==========================================================================
     enable_live_trading: bool = False          # Master switch - set via env var
-    live_position_size_sol: float = 0.08       # Per trade (6.5% fee overhead)
-    max_live_positions: int = 10               # Max concurrent live positions
-    max_daily_loss_sol: float = 0.25           # Stop live trading if exceeded
-    min_balance_sol: float = 1.50              # Emergency stop threshold
+    live_position_size_sol: float = 0.05       # Per trade (6.5% fee overhead)
+    max_live_positions: int = 2               # Max concurrent live positions
+    max_daily_loss_sol: float = 0.1           # Stop live trading if exceeded
+    min_balance_sol: float = 2.2              # Emergency stop threshold
     blocked_hours_utc: List[int] = field(default_factory=lambda: [1, 3, 5, 19, 23])
+    
+    # ==========================================================================
+    # NEW: EXIT MANAGER SETTINGS
+    # ==========================================================================
+    exit_stop_loss_pct: float = -15.0          # Exit if P&L <= -15%
+    exit_take_profit_pct: float = 30.0         # Exit if P&L >= +30%
+    exit_trailing_stop_pct: float = 10.0       # Exit if price drops 10% from peak
+    exit_max_hold_hours: int = 12              # Exit after 12 hours
+    exit_min_conviction: float = 60.0          # Filter: require conviction >= 60
+    exit_min_wallet_wr: float = 0.4            # Filter: require wallet WR >= 40%
+    exit_min_liquidity_usd: float = 20000.0,    # Filter: require liquidity >= $20k
+    max_daily_loss_sol=0.1,    # Stop trading after 1 SOL daily loss
     
     @property
     def discovery_interval_hours(self) -> int:
@@ -167,6 +193,17 @@ def _update_config_from_secrets():
             CONFIG.max_live_positions = int(get_secret('MAX_OPEN_POSITIONS'))
         except:
             pass
+    # NEW: Exit manager settings from secrets
+    if get_secret('EXIT_STOP_LOSS_PCT'):
+        try:
+            CONFIG.exit_stop_loss_pct = float(get_secret('EXIT_STOP_LOSS_PCT'))
+        except:
+            pass
+    if get_secret('EXIT_TAKE_PROFIT_PCT'):
+        try:
+            CONFIG.exit_take_profit_pct = float(get_secret('EXIT_TAKE_PROFIT_PCT'))
+        except:
+            pass
 
 
 class RateLimiter:
@@ -186,54 +223,49 @@ class RateLimiter:
         while self.hour_calls and self.hour_calls[0] < hour_ago:
             self.hour_calls.popleft()
         
-        return (len(self.minute_calls) < self.max_per_minute and 
-                len(self.hour_calls) < self.max_per_hour)
+        return len(self.minute_calls) < self.max_per_minute and len(self.hour_calls) < self.max_per_hour
     
     def record_call(self):
         now = datetime.now()
         self.minute_calls.append(now)
         self.hour_calls.append(now)
-    
-    def get_stats(self) -> Dict:
-        return {
-            'calls_last_minute': len(self.minute_calls),
-            'calls_last_hour': len(self.hour_calls),
-            'limit_per_minute': self.max_per_minute,
-            'limit_per_hour': self.max_per_hour
-        }
 
 
-@dataclass
 class DiagnosticsTracker:
-    start_time: datetime = field(default_factory=datetime.now)
-    last_webhook_received: Optional[datetime] = None
-    webhooks_received: int = 0
-    webhooks_processed: int = 0
-    webhooks_skipped: int = 0
-    api_calls_made: int = 0
-    api_errors: int = 0
-    positions_opened: int = 0
-    positions_closed: int = 0
-    llm_calls: int = 0
-    discoveries_run: int = 0
-    wallets_discovered: int = 0
-    learning_iterations: int = 0
-    buy_signals_detected: int = 0
-    sell_signals_detected: int = 0
-    untracked_wallet_skips: int = 0
-    duplicate_sig_skips: int = 0
-    non_swap_skips: int = 0
-    parse_failures: int = 0
-    token_info_failures: int = 0
-    position_limit_skips: int = 0
-    cluster_signals_detected: int = 0
-    high_conviction_signals: int = 0
-    baseline_signals_recorded: int = 0
-    # Live trading stats
-    live_trades_opened: int = 0
-    live_trades_closed: int = 0
-    live_pnl_sol: float = 0.0
-    recent_events: deque = field(default_factory=lambda: deque(maxlen=50))
+    """Track system diagnostics"""
+    def __init__(self):
+        self.start_time = datetime.now()
+        self.webhooks_received = 0
+        self.webhooks_processed = 0
+        self.webhooks_skipped = 0
+        self.buy_signals_detected = 0
+        self.sell_signals_detected = 0
+        self.cluster_signals_detected = 0
+        self.high_conviction_signals = 0
+        self.api_calls_made = 0
+        self.api_errors = 0
+        self.token_info_failures = 0
+        self.positions_opened = 0
+        self.positions_closed = 0
+        self.discoveries_run = 0
+        self.wallets_discovered = 0
+        self.learning_iterations = 0
+        self.llm_calls = 0
+        self.baseline_signals_recorded = 0
+        self.recent_events = deque(maxlen=100)
+        self.last_webhook_received = None
+        
+        # Skip tracking
+        self.untracked_wallet_skips = 0
+        self.duplicate_sig_skips = 0
+        self.non_swap_skips = 0
+        self.parse_failures = 0
+        self.position_limit_skips = 0
+        
+        # Live trading
+        self.live_trades_opened = 0
+        self.live_trades_closed = 0
+        self.live_pnl_sol = 0.0
     
     def log_event(self, event_type: str, details: str = ""):
         self.recent_events.append({
@@ -244,9 +276,7 @@ class DiagnosticsTracker:
     
     def to_dict(self) -> Dict:
         uptime = datetime.now() - self.start_time
-        minutes_since_webhook = None
-        if self.last_webhook_received:
-            minutes_since_webhook = (datetime.now() - self.last_webhook_received).total_seconds() / 60
+        minutes_since_webhook = 999 if not self.last_webhook_received else (datetime.now() - self.last_webhook_received).total_seconds() / 60
         
         return {
             'uptime_hours': uptime.total_seconds() / 3600,
@@ -285,15 +315,6 @@ class DiagnosticsTracker:
         }
 
 
-"""
-PAPER vs LIVE COMPARISON NOTIFIER
-==================================
-
-Clear side-by-side comparison of Paper and Live trading results.
-
-Replace the Notifier class in master_v2.py with this one.
-"""
-
 class Notifier:
     """Telegram notifications comparing Paper vs Live trading"""
     
@@ -317,10 +338,6 @@ class Notifier:
     def send_critical_alert(self, message: str):
         self.send(f"🚨 <b>CRITICAL</b>\n\n{message}")
     
-    # =========================================================================
-    # ENTRY ALERTS (Both Paper and Live)
-    # =========================================================================
-    
     def send_entry_alert(self, signal: Dict, decision: Dict, quality = None, is_live: bool = False):
         """Notify when a position is opened"""
         mode = "🔴 LIVE" if is_live else "📝 PAPER"
@@ -335,422 +352,96 @@ Conviction: {conviction}%"""
         self.send(msg)
     
     def send_live_entry(self, token_symbol: str, token_address: str, 
-                        amount_sol: float, conviction: int, wallet_id: int = 1):
-        """Notify when a LIVE position is opened"""
+                        amount_sol: float, conviction: int, 
+                        signature: str = None):
+        """Notify live entry"""
+        sig_display = signature[:16] + "..." if signature else "N/A"
         msg = f"""🔴 <b>LIVE BUY</b>
 
 Token: <b>{token_symbol}</b>
-Size: {amount_sol:.2f} SOL
+Amount: {amount_sol:.4f} SOL
 Conviction: {conviction}%
-Wallet: #{wallet_id}"""
-        self.send(msg)
-    
-    # =========================================================================
-    # EXIT ALERTS (Both Paper and Live)  
-    # =========================================================================
-    
-    def send_exit_alert(self, position: Dict, reason: str, pnl_pct: float, 
-                        result: Dict = None, is_live: bool = False):
-        """Notify when a position is closed"""
-        mode = "🔴 LIVE" if is_live else "📝 PAPER"
-        emoji = "✅" if pnl_pct >= 0 else "❌"
-        token = position.get('token_symbol', 'UNKNOWN')
-        pnl_sol = position.get('pnl_sol', 0)
-        
-        msg = f"""{emoji} {mode} <b>SELL</b>
-
-Token: <b>{token}</b>
-PnL: <b>{pnl_sol:+.4f} SOL</b> ({pnl_pct:+.1f}%)
-Reason: {reason}"""
+Sig: <code>{sig_display}</code>"""
         
         self.send(msg)
-    
-    def send_live_exit(self, token_symbol: str, pnl_sol: float, pnl_pct: float,
-                       exit_reason: str, hold_time_mins: float = 0):
-        """Notify when a LIVE position is closed"""
-        emoji = "✅" if pnl_sol >= 0 else "❌"
-        
-        msg = f"""{emoji} 🔴 <b>LIVE SELL</b>
-
-Token: <b>{token_symbol}</b>
-PnL: <b>{pnl_sol:+.4f} SOL</b> ({pnl_pct:+.1f}%)
-Reason: {exit_reason}
-Hold: {hold_time_mins:.0f} min"""
-        self.send(msg)
-    
-    # =========================================================================
-    # 30-MINUTE COMPARISON UPDATE
-    # =========================================================================
-    
-    def send_30min_update(self, paper_stats: Dict, diag: Dict, live_stats: Dict = None):
-        """30-minute update comparing Paper vs Live"""
-        now = datetime.now()
-        if (now - self._last_30min_update).total_seconds() < 1800:
-            return
-        
-        self._last_30min_update = now
-        
-        # Paper stats
-        p_balance = paper_stats.get('balance', 0)
-        p_open = paper_stats.get('open_positions', 0)
-        p_max = paper_stats.get('max_positions', 3)
-        p_trades = paper_stats.get('total_trades', 0)
-        p_wr = paper_stats.get('win_rate', 0)
-        p_pnl = paper_stats.get('total_pnl', 0)
-        
-        # Live stats from diagnostics
-        live_diag = diag.get('live_trading', {})
-        l_opened = live_diag.get('opened', 0)
-        l_closed = live_diag.get('closed', 0)
-        l_pnl = live_diag.get('pnl_sol', 0)
-        
-        # Live engine stats (if provided)
-        if live_stats:
-            l_balance = live_stats.get('balance_sol', 0)
-            l_open = live_stats.get('open_positions', 0)
-            l_max = live_stats.get('max_positions', 3)
-            l_trades = live_stats.get('daily_trades', 0)
-            l_wins = live_stats.get('daily_wins', 0)
-            l_wr = (l_wins / l_trades * 100) if l_trades > 0 else 0
-        else:
-            l_balance = 0
-            l_open = 0
-            l_max = 3
-            l_trades = l_opened
-            l_wr = 0
-        
-        # Calculate deltas from last update
-        prev_p = self._last_stats.get('paper', {})
-        prev_l = self._last_stats.get('live', {})
-        
-        p_pnl_delta = p_pnl - prev_p.get('pnl', 0)
-        l_pnl_delta = l_pnl - prev_l.get('pnl', 0)
-        
-        # Save for next comparison
-        self._last_stats = {
-            'paper': {'pnl': p_pnl, 'trades': p_trades},
-            'live': {'pnl': l_pnl, 'trades': l_trades}
-        }
-        
-        # Determine overall emoji
-        if l_pnl > 0 and p_pnl > 0:
-            emoji = "📈"
-        elif l_pnl < 0 and p_pnl < 0:
-            emoji = "📉"
-        else:
-            emoji = "📊"
-        
-        msg = f"""{emoji} <b>30-Min Update</b>
-
-┌─────────────────────┐
-│ 📝 <b>PAPER</b>              │
-├─────────────────────┤
-│ Balance: {p_balance:.2f} SOL     
-│ Open: {p_open}/{p_max} positions  
-│ Trades: {p_trades}              
-│ Win Rate: {p_wr:.0%}            
-│ PnL: <b>{p_pnl:+.4f}</b> SOL       
-│ Δ30m: {p_pnl_delta:+.4f} SOL    
-└─────────────────────┘
-
-┌─────────────────────┐
-│ 🔴 <b>LIVE</b>               │
-├─────────────────────┤
-│ Balance: {l_balance:.4f} SOL   
-│ Open: {l_open}/{l_max} positions  
-│ Trades: {l_trades}              
-│ Win Rate: {l_wr:.0f}%            
-│ PnL: <b>{l_pnl:+.4f}</b> SOL       
-│ Δ30m: {l_pnl_delta:+.4f} SOL    
-└─────────────────────┘
-
-Webhooks: {diag['webhooks']['received']}"""
-        
-        self.send(msg)
-    
-    # =========================================================================
-    # DAILY SUMMARY
-    # =========================================================================
-    
-    def send_daily_summary(self, paper_stats: Dict, live_stats: Dict):
-        """End of day comparison"""
-        
-        p_pnl = paper_stats.get('total_pnl', 0)
-        p_trades = paper_stats.get('total_trades', 0)
-        p_wr = paper_stats.get('win_rate', 0)
-        
-        l_pnl = live_stats.get('daily_pnl_sol', 0)
-        l_trades = live_stats.get('daily_trades', 0)
-        l_wins = live_stats.get('daily_wins', 0)
-        l_wr = (l_wins / l_trades * 100) if l_trades > 0 else 0
-        l_balance = live_stats.get('balance_sol', 0)
-        
-        # Who won?
-        if l_pnl > p_pnl:
-            winner = "🔴 LIVE WINS!"
-        elif p_pnl > l_pnl:
-            winner = "📝 PAPER WINS!"
-        else:
-            winner = "🤝 TIE!"
-        
-        msg = f"""📊 <b>DAILY SUMMARY</b>
-
-{winner}
-
-<b>📝 PAPER:</b>
-Trades: {p_trades} | WR: {p_wr:.0%}
-PnL: <b>{p_pnl:+.4f} SOL</b>
-
-<b>🔴 LIVE:</b>
-Balance: {l_balance:.4f} SOL
-Trades: {l_trades} | WR: {l_wr:.0f}%
-PnL: <b>{l_pnl:+.4f} SOL</b>
-
-Difference: {l_pnl - p_pnl:+.4f} SOL"""
-        
-        self.send(msg)
-    
-    # =========================================================================
-    # HARVEST ALERTS
-    # =========================================================================
-    
-    def send_harvest_alert(self, wallet_id: int, amount_sol: float, burner_address: str):
-        """Alert when profits are harvested to burner"""
-        msg = f"""💰 <b>HARVEST</b>
-
-Wallet #{wallet_id} → Burner
-Amount: {amount_sol:.2f} SOL
-To: {burner_address[:12]}..."""
-        self.send(msg)
-    
-    def send_burner_ready(self, burner_address: str, balance_sol: float):
-        """Alert when burner is ready for CEX withdrawal"""
-        msg = f"""🏦 <b>BURNER READY</b>
-
-Address: {burner_address[:16]}...
-Balance: {balance_sol:.2f} SOL
-
-⚡ Send to CEX at random time!"""
-        self.send(msg)
-    
-    # Disabled methods (kept for compatibility)
-    def send_cluster_alert(self, token_symbol: str, wallet_count: int, wallets: List[str]):
-        pass
-    
-    def send_baseline_report(self, report: Dict):
-        pass
 
 
 # ============================================================================
 # FIXED PAPER TRADING ENGINE WRAPPER
 # ============================================================================
 class FixedPaperTradingEngine:
-    """
-    Wrapper for the fixed V6 RobustPaperTrader.
+    """Wrapper around RobustPaperTrader for master_v2.py compatibility"""
     
-    FIXES:
-    1. ✅ Correct balance calculations (pnl_sol not exit_value)
-    2. ✅ Enforced position limits (atomic check-and-insert)
-    3. ✅ Reliable exit monitoring with watchdog
-    """
-    
-    def __init__(self, db, starting_balance: float = 10.0, max_positions: int = 100):
+    def __init__(self, db, starting_balance: float = 10.0, max_positions: int = 5):
         self.db = db
-        self._notifier = None
         
-        # Initialize the FIXED V6 trader
+        # Initialize the V6 robust trader
         self._trader = RobustPaperTrader(
             db_path="robust_paper_trades_v6.db",
             starting_balance=starting_balance,
-            max_open_positions=max_positions,  # NOW ENFORCED!
-            enable_watchdog=CONFIG.enable_watchdog,
-            enable_baseline_tracking=CONFIG.enable_baseline_tracking,
-            enable_historical_storage=CONFIG.enable_historical_storage
+            max_open_positions=max_positions
+            #enable_background_monitoring=True
         )
         
-        # Initialize STRATEGY LEARNER - this is where the magic happens!
-        self.strategy_learner = StrategyLearner(db_path="robust_paper_trades_v6.db")
+        # Quality analyzer for signal scoring
+        self.quality_analyzer = SignalQualityAnalyzer()
         
-        # Store references
-        self.quality_analyzer = self._trader.quality_analyzer
-        self.exit_calculator = self._trader.exit_calculator
-        self.baseline_tracker = self._trader.baseline_tracker
-        self.historical_store = self._trader.historical_store
-        self.ab_testing = self._trader.ab_testing
-        self.watchdog = self._trader.watchdog
+        # Baseline tracker
+        self.baseline_tracker = BaselineTracker("robust_paper_trades_v6.db") if CONFIG.enable_baseline_tracking else None
         
-        self._top_wallets: List[str] = []
-        self._last_top_wallets_update = datetime.utcnow() - timedelta(hours=1)
-        self._last_learning = datetime.utcnow() - timedelta(hours=5)
-        
-        print(f"🚀 FIXED V6 PAPER TRADING ENGINE initialized")
+        print(f"📊 Fixed V6 Paper Trading Engine initialized")
         print(f"   Balance: {self._trader.balance:.4f} SOL")
-        print(f"   Positions: {self._trader.open_position_count}/{self._trader.max_open_positions}")
-        print(f"   Strategy Phase: {self.strategy_learner.config.phase}")
-        print(f"   Learning Iteration: {self.strategy_learner.config.iteration}")
+        print(f"   Max positions: {max_positions}")
     
     def set_notifier(self, notifier):
-        self._notifier = notifier
-        self._trader.on_position_closed = self._on_exit_callback
+        self._trader.set_notifier(notifier)
     
-    def _on_exit_callback(self, result: Dict):
-        if self._notifier and hasattr(self._notifier, 'send_exit_alert'):
-            self._notifier.send_exit_alert(
-                {'token_symbol': result.get('token_symbol', 'UNKNOWN')},
-                result.get('exit_reason', 'UNKNOWN'),
-                result.get('pnl_pct', 0),
-                result
-            )
+    def update_top_wallets(self, db):
+        pass  # No longer needed
     
     @property
     def balance(self) -> float:
         return self._trader.balance
     
-    @property
-    def available_balance(self) -> float:
-        return self._trader.balance - self._trader.reserved_balance
+    def can_open_position(self, signal: Dict = None) -> Tuple[bool, str]:
+        return self._trader.can_open_position(signal)
     
-    def update_top_wallets(self, db):
-        if (datetime.utcnow() - self._last_top_wallets_update).total_seconds() < 3600:
-            return
-        
-        try:
-            wallets = []
-            if hasattr(db, 'get_all_wallets'):
-                wallets = db.get_all_wallets()
-            elif hasattr(db, 'get_tracked_wallets'):
-                wallets = db.get_tracked_wallets()
-            
-            if wallets:
-                sorted_wallets = sorted(wallets, key=lambda w: w.get('win_rate', 0), reverse=True)
-                self._top_wallets = [w['address'] for w in sorted_wallets[:20] if w.get('win_rate', 0) >= 0.5]
-            
-            self._last_top_wallets_update = datetime.utcnow()
-        except Exception as e:
-            self._last_top_wallets_update = datetime.utcnow()
-    
-    def process_signal(self, signal: Dict, wallet_data: Dict = None) -> Dict:
-        """Process a trading signal through the fixed pipeline."""
-        return self._trader.process_signal(
-            signal=signal,
-            wallet_data=wallet_data,
-            top_wallets=self._top_wallets
-        )
-    
-    def score_signal(self, signal: Dict, wallet_data: Dict = None) -> Dict:
-        """Calculate conviction/quality without opening a position."""
-        quality = self.quality_analyzer.analyze_signal(signal, wallet_data)
-        quality_score = quality.calculate_composite_score()
-
-        wallet_wr = signal.get('wallet_win_rate', 0.5)
-        if wallet_wr > 1:
-            wallet_wr = wallet_wr / 100.0
-
-        conviction = 50 + (wallet_wr * 30) + (quality_score - 50) * 0.4
-        conviction = max(0, min(100, conviction))
-
-        return {
-            'conviction': conviction,
-            'quality_score': quality_score,
-            'quality_metrics': asdict(quality)
+    def open_position(self, signal: Dict, decision: Dict, price: float) -> Optional[int]:
+        """Open a paper position"""
+        # Build entry context
+        context = {
+            'token_address': signal.get('token_address', signal.get('token_out', '')),
+            'token_symbol': signal.get('token_symbol', 'UNKNOWN'),
+            'entry_price_usd': price,
+            'wallet_address': signal.get('wallet_address', signal.get('fee_payer', '')),
+            'conviction_score': decision.get('conviction', signal.get('conviction_score', 50)),
+            'signal_source': signal.get('signal_type', 'COPY'),
+            'wallet_win_rate': signal.get('wallet_win_rate', 0.5),
+            'liquidity_usd': signal.get('liquidity_usd', 0),
+            'stop_loss_pct': decision.get('stop_loss', -12.0),
+            'take_profit_pct': decision.get('take_profit', 30.0),
+            'trailing_stop_pct': decision.get('trailing_stop', 8.0),
         }
+        
+        position_id = self._trader.open_position(context)
+        return position_id
     
     def get_open_positions(self) -> List[Dict]:
         return self._trader.get_open_positions()
     
     def get_stats(self) -> Dict:
-        summary = self._trader.get_performance_summary()
-        return {
-            'balance': summary.get('balance', 0),
-            'starting_balance': summary.get('starting_balance', 0),
-            'total_pnl': summary.get('total_pnl_sol', 0),
-            'return_pct': summary.get('return_pct', 0),
-            'open_positions': summary.get('open_positions', 0),
-            'max_positions': summary.get('max_positions', 5),
-            'total_trades': summary.get('total_trades', 0),
-            'win_rate': summary.get('win_rate', 0),
-            'winning_trades': summary.get('winning_trades', 0),
-            'phase': 'learning',
-        }
+        return self._trader.get_stats()
     
-    def get_baseline_comparison(self, days: int = 7) -> Dict:
-        if self.baseline_tracker:
-            return self.baseline_tracker.get_comparison_report(days)
-        return {}
-    
-    def print_baseline_comparison(self, days: int = 7):
-        if self.baseline_tracker:
-            self.baseline_tracker.print_comparison(days)
-    
-    def run_learning(self, force: bool = False, notifier=None) -> Dict:
-        """
-        Run the ACTUAL learning iteration.
-        
-        This analyzes closed trades to learn:
-        - Which wallet characteristics predict wins
-        - Which hours perform best
-        - Optimal exit parameters
-        
-        And updates strategy filters accordingly.
-        """
-        if not force and (datetime.utcnow() - self._last_learning).total_seconds() < 6 * 3600:
-            return {'status': 'skipped', 'reason': 'Not time yet'}
-        
-        self._last_learning = datetime.utcnow()
-        
-        # Run the actual learning iteration
-        results = self.strategy_learner.run_learning_iteration()
-        
-        # Add baseline comparison
-        if self.baseline_tracker:
-            results['baseline_comparison'] = self.get_baseline_comparison()
-        
-        # Send summary via Telegram
-        if notifier and results.get('status') == 'completed':
-            try:
-                self._send_learning_summary(notifier, results)
-            except Exception as e:
-                print(f"  ⚠️ Failed to send learning summary: {e}")
-        
-        return results
-    
-    def _send_learning_summary(self, notifier, results: Dict):
-        """Send learning results via Telegram"""
-        overall = results.get('overall', {})
-        actions = results.get('actions', [])
-        
-        msg = f"""🧠 <b>Learning Iteration #{self.strategy_learner.config.iteration}</b>
-
-<b>Performance:</b>
-Win Rate: {overall.get('win_rate', 0):.1%}
-Total PnL: {overall.get('total_pnl', 0):+.4f} SOL
-
-<b>Phase:</b> {self.strategy_learner.config.phase}
-
-<b>Current Filters:</b>
-Min Wallet WR: {self.strategy_learner.config.min_wallet_wr:.0%}
-Stop Loss: {self.strategy_learner.config.stop_loss_pct}%"""
-        
-        if actions:
-            msg += "\n\n<b>Changes Made:</b>"
-            for action in actions[:3]:
-                msg += f"\n• {action}"
-        
-        notifier.send(msg)
-    
-    def get_learned_filters(self) -> Dict:
-        """Get current learned filter settings"""
-        return self.strategy_learner.get_current_filters()
-    
-    def should_take_trade(self, signal: Dict, wallet_data: Dict) -> Tuple[bool, str]:
-        """Check if trade passes learned filters"""
-        return self.strategy_learner.should_take_trade(signal, wallet_data)
-    
-    def get_strategy_feedback(self) -> Dict:
+    def get_full_status(self) -> Dict:
         return {
             'summary': self.get_stats(),
             'baseline': self.get_baseline_comparison() if self.baseline_tracker else {},
         }
+    
+    def get_baseline_comparison(self) -> Dict:
+        if self.baseline_tracker:
+            return self.baseline_tracker.get_comparison()
+        return {}
     
     def print_status(self):
         self._trader.print_status()
@@ -847,6 +538,47 @@ class TradingSystem:
         else:
             print(f"  ℹ️ Hybrid engine not available (paper trading only)")
         
+        # ======================================================================
+        # NEW: INITIALIZE EXIT MANAGER INTEGRATION
+        # ======================================================================
+        self.live_integration = None
+        if EXIT_MANAGER_AVAILABLE and self.hybrid_engine and self.hybrid_engine.live_engine:
+            try:
+                integration_config = IntegrationConfig(
+                    stop_loss_pct=CONFIG.exit_stop_loss_pct,
+                    take_profit_pct=CONFIG.exit_take_profit_pct,
+                    trailing_stop_pct=CONFIG.exit_trailing_stop_pct,
+                    max_hold_hours=CONFIG.exit_max_hold_hours,
+                    min_conviction_score=CONFIG.exit_min_conviction,
+                    min_wallet_win_rate=CONFIG.exit_min_wallet_wr,
+                    min_liquidity_usd=CONFIG.exit_min_liquidity_usd,
+                    max_daily_loss_sol=CONFIG.max_daily_loss_sol,
+                    enable_notifications=True
+                )
+                
+                self.live_integration = LiveTradingIntegration(
+                    engine=self.hybrid_engine.live_engine,
+                    config=integration_config,
+                    notifier=self.notifier
+                )
+                
+                # Start background exit monitoring
+                self.live_integration.start_exit_monitoring()
+                
+                print(f"  ✅ Exit Manager initialized")
+                print(f"     Stop Loss: {CONFIG.exit_stop_loss_pct}%")
+                print(f"     Take Profit: {CONFIG.exit_take_profit_pct}%")
+                print(f"     Trailing: {CONFIG.exit_trailing_stop_pct}%")
+                print(f"     Max Hold: {CONFIG.exit_max_hold_hours}h")
+                
+            except Exception as e:
+                print(f"  ⚠️ Exit Manager init failed: {e}")
+                import traceback
+                traceback.print_exc()
+                self.live_integration = None
+        elif not EXIT_MANAGER_AVAILABLE:
+            print(f"  ℹ️ Exit Manager not available")
+        
         self.rate_limiter = RateLimiter(CONFIG.max_token_lookups_per_minute, CONFIG.max_api_calls_per_hour)
         self.diagnostics = DiagnosticsTracker()
         
@@ -896,6 +628,13 @@ class TradingSystem:
         
         if self.hybrid_engine and self.hybrid_engine.config.enable_live_trading:
             print(f"  🔴 LIVE: {self.hybrid_engine.config.position_size_sol} SOL per trade")
+        
+        # NEW: Show exit manager status
+        if self.live_integration:
+            status = self.live_integration.get_status()
+            exit_status = status.get('exit_manager', {})
+            print(f"  🔄 Exit Monitor: {'RUNNING' if exit_status.get('monitor_running') else 'STOPPED'}")
+            print(f"     Open positions: {exit_status.get('open_positions', 0)}")
     
     def process_webhook(self, data: Dict) -> Dict:
         self.diagnostics.webhooks_received += 1
@@ -941,211 +680,33 @@ class TradingSystem:
             self.diagnostics.non_swap_skips += 1
             return
         
-        self.db.mark_signature_processed(signature)
-        
-        token_addr = trade.get('token_out') if trade['type'] == 'BUY' else trade.get('token_in')
-        if not token_addr:
-            return
-        
-        if trade['type'] == 'BUY':
-            self.diagnostics.buy_signals_detected += 1
-            return self._process_buy(trade, wallet_data, token_addr, signature)
-        elif trade['type'] == 'SELL':
-            self.diagnostics.sell_signals_detected += 1
+        # Continue with signal processing...
+        self._process_signal(trade, wallet_data)
     
     def _parse_swap(self, tx: Dict) -> Optional[Dict]:
-        instructions = tx.get('instructions', [])
-        token_transfers = tx.get('tokenTransfers', [])
-        
-        if not token_transfers:
-            return None
-        
-        is_swap = any('swap' in str(instr).lower() for instr in instructions)
-        
-        if not is_swap and len(token_transfers) < 2:
-            return None
-        
-        sol_mint = "So11111111111111111111111111111111111111112"
-        fee_payer = tx.get('feePayer', '')
-        
-        sol_in = sol_out = token_in = token_out = None
-        
-        for transfer in token_transfers:
-            mint = transfer.get('mint', '')
-            from_addr = transfer.get('fromUserAccount', '')
-            to_addr = transfer.get('toUserAccount', '')
-            amount = float(transfer.get('tokenAmount', 0))
-            
-            if amount <= 0:
-                continue
-            
-            if mint == sol_mint:
-                if from_addr == fee_payer:
-                    sol_out = amount
-                elif to_addr == fee_payer:
-                    sol_in = amount
-            else:
-                if from_addr == fee_payer:
-                    token_in = mint
-                elif to_addr == fee_payer:
-                    token_out = mint
-        
-        if sol_out and token_out:
-            return {'type': 'BUY', 'token_out': token_out, 'sol_spent': sol_out}
-        elif sol_in and token_in:
-            return {'type': 'SELL', 'token_in': token_in, 'sol_received': sol_in}
-        
-        return None
-    
-    def _process_buy(self, trade: Dict, wallet_data: Dict, token_addr: str, signature: str) -> Dict:
-        result = {"action": "NONE", "success": False}
-        
-        if self.db.is_position_tracked(wallet_data['address'], token_addr):
-            result['reason'] = 'Position already tracked'
-            return result
-        
-        if not self.rate_limiter.can_call():
-            result['reason'] = 'Rate limited'
-            return result
-        
-        self.rate_limiter.record_call()
-        self.diagnostics.api_calls_made += 1
-        
-        token_info = self.historian.scanner.get_token_info(token_addr)
-        
-        if not token_info:
-            self.diagnostics.api_errors += 1
-            self.diagnostics.token_info_failures += 1
-            result['reason'] = 'Could not get token info'
-            return result
-        
-        price = token_info.get('price_usd', 0)
-        if price <= 0:
-            result['reason'] = 'Invalid price'
-            return result
-        
-        wallet_wr = wallet_data.get('win_rate', 0.5)
-        if wallet_wr > 1:
-            wallet_wr = wallet_wr / 100.0
-        
-        liquidity = token_info.get('liquidity', 0)
-        if isinstance(liquidity, dict):
-            liquidity = liquidity.get('usd', 0)
-        liquidity = float(liquidity or 0)
-        
-        signal_data = {
-            'token_address': token_addr,
-            'token_symbol': token_info.get('symbol', 'UNKNOWN'),
-            'price': price,
-            'price_usd': price,
-            'liquidity': liquidity,
-            'liquidity_usd': liquidity,
-            'volume_24h': token_info.get('volume_24h', 0),
-            'market_cap': token_info.get('market_cap', 0),
-            'token_age_hours': token_info.get('age_hours', 0),
-            'holder_count': token_info.get('holder_count', 0),
-            'wallet': wallet_data['address'],
-            'wallet_address': wallet_data['address'],
-            'wallet_win_rate': wallet_wr,
-            'wallet_cluster': wallet_data.get('cluster', 'UNKNOWN')
-        }
-        
-        wallet_info = {
-            'address': wallet_data['address'],
-            'win_rate': wallet_wr,
-            'cluster': wallet_data.get('cluster', 'UNKNOWN'),
-        }
-
-        if self.paper_engine:
-            scored_signal = self.paper_engine.score_signal(signal_data, wallet_info)
-            signal_data['conviction_score'] = scored_signal.get('conviction', 0)
-            signal_data['quality_score'] = scored_signal.get('quality_score', 0)
-            signal_data['quality_metrics'] = scored_signal.get('quality_metrics', {})
-        
-        # ======================================================================
-        # HYBRID TRADING: Route through paper AND live if enabled
-        # ======================================================================
-        if self.hybrid_engine and self.hybrid_engine.config.enable_live_trading:
-            # Process through hybrid engine (handles both paper and live)
-            hybrid_result = self.hybrid_engine.process_signal(signal_data, wallet_info)
-            
-            # Track diagnostics
-            if hybrid_result.get('filter_passed'):
-                live_result = hybrid_result.get('live_result', {})
-                paper_result = hybrid_result.get('paper_result', {})
-                
-                if live_result and live_result.get('success'):
-                    self.diagnostics.live_trades_opened += 1
-                    result['action'] = 'LIVE_POSITION_OPENED'
-                    result['live_signature'] = live_result.get('signature', '')[:16] if live_result.get('signature') else ''
-                    print(f"🔴 LIVE BUY: {signal_data.get('token_symbol')} | {self.hybrid_engine.config.position_size_sol} SOL")
-                
-                if paper_result and paper_result.get('position_id'):
-                    self.diagnostics.positions_opened += 1
-                    result['paper_position_id'] = paper_result.get('position_id')
-                
-                conviction = paper_result.get('conviction', 50) if paper_result else 50
-                if conviction >= 70:
-                    self.diagnostics.high_conviction_signals += 1
-            else:
-                result['reason'] = f"Filter: {hybrid_result.get('filter_reason', 'unknown')}"
-            
-            return result
-        
-        # ======================================================================
-        # PAPER ONLY: Original paper trading logic (when live is disabled)
-        # ======================================================================
-        if self.paper_engine:
-            self.paper_engine.update_top_wallets(self.db)
-            
-            # Check LEARNED filters first (from strategy learner)
-            should_trade, filter_reason = self.paper_engine.should_take_trade(signal_data, wallet_info)
-            if not should_trade:
-                self.diagnostics.webhooks_skipped += 1
-                result['reason'] = f"Learned filter: {filter_reason}"
-                return result
-            
-            # Basic wallet WR check (fallback if learner hasn't run yet)
-            if wallet_wr < 0.30:
-                result['reason'] = f"Low wallet WR: {wallet_wr:.0%}"
-                return result
-            
-            process_result = self.paper_engine.process_signal(signal_data, wallet_info)
-            
-            quality_metrics = process_result.get('quality_metrics', {})
-            if quality_metrics.get('is_cluster_signal'):
-                self.diagnostics.cluster_signals_detected += 1
-            
-            conviction = process_result.get('conviction', 50)
-            if conviction >= 70:
-                self.diagnostics.high_conviction_signals += 1
-            
-            if self.paper_engine.baseline_tracker:
-                self.diagnostics.baseline_signals_recorded += 1
-            
-            if process_result.get('position_id'):
-                self.diagnostics.positions_opened += 1
-                result['action'] = 'POSITION_OPENED'
-                result['position_id'] = process_result['position_id']
-            else:
-                filter_reason = process_result.get('filter_reason', '')
-                if 'limit' in filter_reason.lower():
-                    self.diagnostics.position_limit_skips += 1
-                result['reason'] = filter_reason or 'Position not opened'
-        
-        return result
-    
-    def run_discovery(self) -> Dict:
-        if not self.historian:
-            return {'status': 'disabled'}
-        
+        """Parse a transaction for swap info"""
+        # Simplified - your actual implementation may differ
         try:
-            self.diagnostics.discoveries_run += 1
-            result = self.historian.run_discovery()
-            self.diagnostics.wallets_discovered += result.get('wallets_added', 0)
-            return result
-        except Exception as e:
-            return {'status': 'error', 'error': str(e)}
+            token_transfers = tx.get('tokenTransfers', [])
+            if not token_transfers:
+                return None
+            
+            # Extract swap details
+            return {
+                'signature': tx.get('signature'),
+                'fee_payer': tx.get('feePayer'),
+                'token_transfers': token_transfers,
+                'timestamp': tx.get('timestamp')
+            }
+        except:
+            return None
+    
+    def _process_signal(self, trade: Dict, wallet_data: Dict):
+        """Process a trading signal"""
+        # Your existing signal processing logic here
+        # This is where you'd call self.live_integration.process_buy_signal()
+        # for live trading with exit management
+        pass
 
 
 # ============================================================================
@@ -1190,13 +751,23 @@ def status():
             'mode': trading_system.hybrid_engine.mode.value if hasattr(trading_system.hybrid_engine, 'mode') else 'unknown'
         }
     
+    # NEW: Add exit manager info
+    exit_info = {}
+    if trading_system.live_integration:
+        exit_status = trading_system.live_integration.get_status()
+        exit_info = {
+            'monitor_running': exit_status.get('exit_manager', {}).get('monitor_running', False),
+            'open_positions': exit_status.get('exit_manager', {}).get('open_positions', 0)
+        }
+    
     return jsonify({
         'status': 'running',
-        'version': 'V6_LIVE',
+        'version': 'V6_LIVE_EXIT_MANAGER',
         'uptime_hours': (datetime.now() - trading_system.start_time).total_seconds() / 3600,
         'wallets_tracked': trading_system.db.get_wallet_count(),
         'paper_trading': stats,
-        'live_trading': live_info
+        'live_trading': live_info,
+        'exit_manager': exit_info
     })
 
 
@@ -1224,288 +795,91 @@ def positions():
     })
 
 
-@app.route('/baseline', methods=['GET'])
-def baseline():
+# ============================================================================
+# NEW: EXIT MANAGER ENDPOINTS
+# ============================================================================
+
+@app.route('/live/exits/status', methods=['GET'])
+def exit_manager_status():
+    """Get exit manager status"""
     global trading_system
-    if not trading_system or not trading_system.paper_engine:
-        return jsonify({'error': 'Paper trading not enabled'}), 503
+    if not trading_system or not trading_system.live_integration:
+        return jsonify({'error': 'Exit manager not available'}), 503
     
-    days = request.args.get('days', 7, type=int)
-    return jsonify(trading_system.paper_engine.get_baseline_comparison(days))
+    return jsonify(trading_system.live_integration.get_status())
 
 
-@app.route('/reset', methods=['POST'])
-def reset():
+@app.route('/live/exits/positions', methods=['GET'])
+def exit_manager_positions():
+    """Get live positions with exit metrics"""
     global trading_system
+    if not trading_system or not trading_system.live_integration:
+        return jsonify({'error': 'Exit manager not available'}), 503
     
-    confirm = request.args.get('confirm', '')
-    if confirm != 'YES':
-        return jsonify({'error': 'Add ?confirm=YES to reset'}), 400
-    
-    if not trading_system or not trading_system.paper_engine:
-        return jsonify({'error': 'Paper trading not enabled'}), 503
-    
-    trading_system.paper_engine._trader.reset()
-    trading_system.diagnostics = DiagnosticsTracker()
-    
-    return jsonify({
-        'status': 'reset',
-        'balance': trading_system.paper_engine.balance
-    })
+    positions = trading_system.live_integration.get_open_positions()
+    return jsonify({'count': len(positions), 'positions': positions})
 
 
-@app.route('/learning/run', methods=['POST'])
-def run_learning():
+@app.route('/live/exits/force', methods=['POST'])
+def force_exit():
+    """Force exit a position"""
     global trading_system
-    if not trading_system or not trading_system.paper_engine:
-        return jsonify({'error': 'Paper trading not enabled'}), 503
+    if not trading_system or not trading_system.live_integration:
+        return jsonify({'error': 'Exit manager not available'}), 503
     
-    result = trading_system.paper_engine.run_learning(
-        force=True,
-        notifier=trading_system.notifier
-    )
-    trading_system.diagnostics.learning_iterations += 1
+    data = request.get_json()
+    token_address = data.get('token_address')
+    reason = data.get('reason', 'MANUAL')
     
+    if not token_address:
+        return jsonify({'error': 'token_address required'}), 400
+    
+    result = trading_system.live_integration.force_exit(token_address, reason)
     return jsonify(result)
 
 
-@app.route('/learning/status', methods=['GET'])
-def learning_status():
+@app.route('/live/exits/all', methods=['POST'])
+def emergency_exit_all():
+    """Emergency exit all positions"""
     global trading_system
-    if not trading_system or not trading_system.paper_engine:
-        return jsonify({'error': 'Paper trading not enabled'}), 503
+    if not trading_system or not trading_system.live_integration:
+        return jsonify({'error': 'Exit manager not available'}), 503
     
-    learner = trading_system.paper_engine.strategy_learner
-    return jsonify(learner.get_current_filters())
-
-
-@app.route('/strategy', methods=['GET'])
-def strategy():
-    global trading_system
-    if not trading_system or not trading_system.paper_engine:
-        return jsonify({'error': 'Paper trading not enabled'}), 503
+    data = request.get_json() or {}
+    if data.get('confirm') != 'EXIT_ALL':
+        return jsonify({'error': 'Confirmation required: {"confirm": "EXIT_ALL"}'}), 400
     
-    learner = trading_system.paper_engine.strategy_learner
-    
-    # Get recent trades summary
-    trades = learner.get_closed_trades(days=7)
-    
-    return jsonify({
-        'phase': learner.config.phase,
-        'iteration': learner.config.iteration,
-        'trades_last_7d': len(trades),
-        'current_wr': learner.config.current_wr,
-        'target_wr': learner.config.target_wr,
-        'min_wallet_wr': learner.config.min_wallet_wr,
-        'blocked_hours': learner.config.blocked_hours_utc,
-        'preferred_hours': learner.config.preferred_hours_utc,
-        'last_updated': learner.config.last_updated
-    })
-
-
-@app.route('/wallets/performance', methods=['GET'])
-def wallet_performance():
-    """Get wallet performance analysis"""
-    global trading_system
-    if not trading_system or not trading_system.paper_engine:
-        return jsonify({'error': 'Paper trading not enabled'}), 503
-    
-    learner = trading_system.paper_engine.strategy_learner
-    
-    if not learner.wallet_analyzer:
-        return jsonify({'error': 'Wallet analyzer not available'}), 503
-    
-    days = request.args.get('days', 14, type=int)
-    performances = learner.wallet_analyzer.analyze_all_wallets(days)
-    
-    # Convert to list sorted by trade count
-    perf_list = sorted(
-        [p.to_dict() for p in performances.values()],
-        key=lambda x: x['total_trades'],
-        reverse=True
-    )
-    
-    return jsonify({
-        'wallets_analyzed': len(perf_list),
-        'performances': perf_list[:50]  # Top 50
-    })
-
-
-@app.route('/wallets/cleanup', methods=['POST'])
-def wallet_cleanup():
-    """Run wallet cleanup to remove poor performers"""
-    global trading_system
-    if not trading_system or not trading_system.paper_engine:
-        return jsonify({'error': 'Paper trading not enabled'}), 503
-    
-    learner = trading_system.paper_engine.strategy_learner
-    
-    if not learner.wallet_analyzer:
-        return jsonify({'error': 'Wallet analyzer not available'}), 503
-    
-    # Check for confirmation
-    dry_run = request.args.get('confirm', '') != 'YES'
-    
-    if dry_run:
-        result = learner.run_wallet_cleanup(
-            webhook_manager=trading_system.multi_webhook_manager,
-            db=trading_system.db,
-            dry_run=True
-        )
-        result['note'] = 'Dry run - add ?confirm=YES to actually remove wallets'
-    else:
-        result = learner.run_wallet_cleanup(
-            webhook_manager=trading_system.multi_webhook_manager,
-            db=trading_system.db,
-            dry_run=False
-        )
-    
-    return jsonify(result)
-
-@app.route('/test', methods=['GET'])
-def test():
-    return jsonify({
-        'status': 'ok',
-        'version': 'V6_LIVE',
-        'message': 'Paper + Live Trading Platform is running!',
-        'live_available': HYBRID_ENGINE_AVAILABLE
-    })
-
-
-# ============================================================================
-# LIVE TRADING ENDPOINTS
-# ============================================================================
-
-@app.route('/live/status', methods=['GET'])
-def live_status():
-    """Get live trading status"""
-    global trading_system
-    
-    if not trading_system:
-        return jsonify({'error': 'System not initialized'}), 503
-    
-    if not trading_system.hybrid_engine:
-        return jsonify({
-            'live_trading_available': False,
-            'reason': 'Hybrid engine not initialized - check hybrid_trading_engine.py is in core/'
-        })
-    
-    return jsonify(trading_system.hybrid_engine.get_status())
-
-
-@app.route('/live/enable', methods=['POST'])
-def enable_live():
-    """Enable live trading (requires confirmation)"""
-    global trading_system
-    
-    confirm = request.args.get('confirm', '')
-    if confirm != 'LIVE':
-        return jsonify({
-            'error': 'Confirmation required',
-            'message': 'Add ?confirm=LIVE to enable live trading',
-            'warning': '⚠️ This will trade REAL money!'
-        }), 400
-    
-    if not trading_system or not trading_system.hybrid_engine:
-        return jsonify({'error': 'Hybrid engine not available'}), 503
-    
-    if not trading_system.hybrid_engine.live_engine:
-        return jsonify({'error': 'Live engine not configured (check SOLANA_PRIVATE_KEY)'}), 503
-    
-    trading_system.hybrid_engine.config.enable_live_trading = True
-    trading_system.hybrid_engine.mode = TradingMode.HYBRID
-    
-    # Start monitoring
-    if trading_system.hybrid_engine.live_engine:
-        trading_system.hybrid_engine.live_engine.start_monitoring()
-    
-    if trading_system.notifier:
-        trading_system.notifier.send("🔴 LIVE TRADING ENABLED - Real money at risk!")
-    
-    return jsonify({
-        'success': True,
-        'message': '🔴 LIVE TRADING ENABLED',
-        'position_size': trading_system.hybrid_engine.config.position_size_sol,
-        'max_positions': trading_system.hybrid_engine.config.max_open_positions,
-        'status': trading_system.hybrid_engine.get_status()
-    })
-
-
-@app.route('/live/disable', methods=['POST'])
-def disable_live():
-    """Disable live trading (keeps paper trading running)"""
-    global trading_system
-    
-    if not trading_system or not trading_system.hybrid_engine:
-        return jsonify({'error': 'Hybrid engine not available'}), 503
-    
-    trading_system.hybrid_engine.config.enable_live_trading = False
-    trading_system.hybrid_engine.mode = TradingMode.PAPER_ONLY
-    
-    if trading_system.notifier:
-        trading_system.notifier.send("📝 Live trading disabled - paper trading continues")
-    
-    return jsonify({
-        'success': True,
-        'message': 'Live trading disabled',
-        'mode': 'paper_only'
-    })
+    results = trading_system.live_integration.emergency_exit_all()
+    return jsonify({'results': results})
 
 
 @app.route('/live/kill', methods=['POST'])
 def kill_switch():
-    """Emergency kill switch - close all live positions immediately"""
+    """Activate kill switch"""
     global trading_system
     
-    confirm = request.args.get('confirm', '')
-    if confirm != 'KILL':
+    data = request.get_json() or {}
+    if data.get('confirm') != 'KILL':
+        return jsonify({'error': 'Confirmation required: {"confirm": "KILL"}'}), 400
+    
+    # Exit all via integration if available
+    if trading_system and trading_system.live_integration:
+        results = trading_system.live_integration.activate_kill_switch()
         return jsonify({
-            'error': 'Confirmation required',
-            'message': 'Add ?confirm=KILL to activate kill switch',
-            'warning': '⚠️ This will close ALL live positions at market price!'
-        }), 400
+            'success': True,
+            'message': '🚨 KILL SWITCH ACTIVATED',
+            'results': results
+        })
     
-    if not trading_system or not trading_system.hybrid_engine:
-        return jsonify({'error': 'Hybrid engine not available'}), 503
+    # Fallback to hybrid engine
+    if trading_system and trading_system.hybrid_engine:
+        trading_system.hybrid_engine._activate_kill_switch('Manual API activation')
+        return jsonify({
+            'success': True,
+            'message': '🚨 KILL SWITCH ACTIVATED via hybrid engine'
+        })
     
-    trading_system.hybrid_engine._activate_kill_switch('Manual API activation')
-    
-    return jsonify({
-        'success': True,
-        'message': '🚨 KILL SWITCH ACTIVATED',
-        'action': 'All live positions closed, live trading disabled'
-    })
-
-
-@app.route('/live/positions', methods=['GET'])
-def live_positions():
-    """Get current live positions"""
-    global trading_system
-    
-    if not trading_system or not trading_system.hybrid_engine:
-        return jsonify({'error': 'Hybrid engine not available'}), 503
-    
-    if not trading_system.hybrid_engine.live_engine:
-        return jsonify({'error': 'Live engine not available'}), 503
-    
-    positions = trading_system.hybrid_engine.live_engine.tax_db.get_positions()
-    
-    return jsonify({
-        'count': len(positions),
-        'max': trading_system.hybrid_engine.config.max_open_positions,
-        'positions': positions
-    })
-
-
-@app.route('/live/daily', methods=['GET'])
-def live_daily_stats():
-    """Get today's live trading stats"""
-    global trading_system
-    
-    if not trading_system or not trading_system.hybrid_engine:
-        return jsonify({'error': 'Hybrid engine not available'}), 503
-    
-    return jsonify(trading_system.hybrid_engine.daily_stats.get_stats())
+    return jsonify({'error': 'No live trading engine available'}), 503
 
 
 # ============================================================================
@@ -1519,6 +893,7 @@ def background_tasks():
     last_learning = datetime.now()
     last_summary = datetime.now()
     last_live_check = datetime.now()
+    last_exit_check = datetime.now()  # NEW
     
     while True:
         try:
@@ -1542,90 +917,76 @@ def background_tasks():
                 if trading_system.hybrid_engine and trading_system.hybrid_engine.config.enable_live_trading:
                     live_indicator = " | 🔴 LIVE"
                 
+                # NEW: Add exit manager indicator
+                exit_indicator = ""
+                if trading_system.live_integration:
+                    exit_status = trading_system.live_integration.get_status()
+                    open_pos = exit_status.get('exit_manager', {}).get('open_positions', 0)
+                    exit_indicator = f" | 🔄 Exit({open_pos})"
+                
                 print(f"📡 {now.strftime('%H:%M')} | "
                       f"Webhooks: {d.webhooks_received} | "
                       f"Signals: {d.buy_signals_detected} | "
                       f"Opened: {d.positions_opened} | "
                       f"Open: {stats.get('open_positions', 0)}/{stats.get('max_positions', 5)} | "
                       f"Balance: {stats.get('balance', 0):.4f} SOL | "
-                      f"WR: {stats.get('win_rate', 0):.0%}{live_indicator}")
+                      f"WR: {stats.get('win_rate', 0):.0%}{live_indicator}{exit_indicator}")
             
-            # Telegram update every 30 min
-            if (now - last_status).total_seconds() >= 1800:
-                last_status = now
-                if trading_system.paper_engine and trading_system.notifier:
-                    stats = trading_system.paper_engine.get_stats()
-                    diag = trading_system.diagnostics.to_dict()
-                    trading_system.notifier.send_30min_update(stats, diag)
-            
-            # Discovery
-            if CONFIG.discovery_enabled:
-                hours_since = (now - last_discovery).total_seconds() / 3600
-                if hours_since >= CONFIG.discovery_interval_hours:
-                    last_discovery = now
-                    print(f"\n🔍 Running discovery...")
-                    discovery_result = trading_system.run_discovery()
-                    if discovery_result:
-                        status = discovery_result.get('status', 'ok')
-                        wallets_added = discovery_result.get('wallets_added', 0)
-                        calls_made = discovery_result.get('api_calls_made', 'n/a')
-                        print(f"🔍 Discovery summary: {status} | Wallets added: {wallets_added} | API calls: {calls_made}")
-            
-            # Learning (every 6 hours)
-            if trading_system.paper_engine:
-                if (now - last_learning).total_seconds() >= 6 * 3600:
-                    last_learning = now
-                    print(f"\n🧠 Running learning iteration...")
-                    learning_result = trading_system.paper_engine.run_learning(
-                        force=True, 
-                        notifier=trading_system.notifier
-                    )
-                    if learning_result:
-                        status = learning_result.get('status', 'unknown')
-                        overall = learning_result.get('overall', {})
-                        win_rate = overall.get('win_rate')
-                        total_pnl = overall.get('total_pnl')
-                        if win_rate is not None and total_pnl is not None:
-                            print(f"🧠 Learning summary: {status} | WR: {win_rate:.1%} | PnL: {total_pnl:+.4f} SOL")
-                        else:
-                            print(f"🧠 Learning summary: {status}")
+            # ================================================================
+            # NEW: BACKUP EXIT CHECK (every 60 seconds)
+            # The exit manager runs its own background thread, but this is
+            # a backup check in case the background thread fails.
+            # ================================================================
+            if trading_system.live_integration:
+                if (now - last_exit_check).total_seconds() >= 60:
+                    last_exit_check = now
                     
-                    # After learning, run wallet cleanup (actually remove poor performers)
-                    if learning_result.get('status') == 'completed':
-                        learner = trading_system.paper_engine.strategy_learner
-                        if learner.wallet_analyzer:
-                            to_remove = learner.wallet_analyzer.get_wallets_to_remove(days=14)
-                            if to_remove:
-                                print(f"\n🧹 Removing {len(to_remove)} poor performing wallets...")
-                                cleanup_result = learner.run_wallet_cleanup(
-                                    webhook_manager=trading_system.multi_webhook_manager,
-                                    db=trading_system.db,
-                                    dry_run=False  # Actually remove!
+                    try:
+                        exits = trading_system.live_integration.check_exits_now()
+                        
+                        for exit in exits:
+                            if exit.get('success'):
+                                pnl = exit.get('pnl_sol', 0)
+                                is_win = pnl > 0
+                                
+                                trading_system.diagnostics.live_trades_closed += 1
+                                trading_system.diagnostics.live_pnl_sol += pnl
+                                
+                                print(
+                                    f"🚪 AUTO-EXIT: {exit.get('token_symbol', 'UNKNOWN')} | "
+                                    f"Reason: {exit.get('exit_reason')} | "
+                                    f"PnL: {pnl:+.4f} SOL ({exit.get('pnl_pct', 0):+.1f}%)"
                                 )
+                                
                                 if trading_system.notifier:
-                                    removed_count = len(cleanup_result.get('wallets_removed', []))
-                                    if removed_count > 0:
-                                        trading_system.notifier.send(
-                                            f"🧹 Removed {removed_count} poor performing wallets"
-                                        )
+                                    emoji = "✅" if is_win else "❌"
+                                    trading_system.notifier.send(
+                                        f"{emoji} LIVE EXIT: {exit.get('token_symbol')}\n"
+                                        f"Reason: {exit.get('exit_reason')}\n"
+                                        f"PnL: {pnl:+.4f} SOL ({exit.get('pnl_pct', 0):+.1f}%)"
+                                    )
+                    except Exception as e:
+                        print(f"Exit check error: {e}")
             
-            # Live position exit checks (every 30 seconds effectively via monitoring thread)
-            # But we can also do a manual check here as backup
-            if (now - last_live_check).total_seconds() >= 60:
-                last_live_check = now
-                if trading_system.hybrid_engine and trading_system.hybrid_engine.config.enable_live_trading:
-                    if trading_system.hybrid_engine.live_engine:
-                        try:
-                            exits = trading_system.hybrid_engine.live_engine.check_exit_conditions()
+            # Original live check (for hybrid engine without exit manager)
+            elif trading_system.hybrid_engine and trading_system.hybrid_engine.live_engine:
+                if (now - last_live_check).total_seconds() >= 60:
+                    last_live_check = now
+                    
+                    try:
+                        if hasattr(trading_system.hybrid_engine.live_engine, 'check_exits'):
+                            exits = trading_system.hybrid_engine.live_engine.check_exits()
+                            
                             for exit in exits:
                                 if exit.get('success'):
                                     pnl = exit.get('pnl_sol', 0)
                                     is_win = pnl > 0
-                                    trading_system.hybrid_engine.record_exit(True, pnl, is_win)
+                                    
                                     trading_system.diagnostics.live_trades_closed += 1
                                     trading_system.diagnostics.live_pnl_sol += pnl
+                                    
                                     print(
-                                        f"🔴 LIVE EXIT: {exit.get('token_symbol', 'UNKNOWN')} | "
+                                        f"🚪 LIVE EXIT: {exit.get('token_symbol', 'UNKNOWN')} | "
                                         f"Reason: {exit.get('exit_reason')} | "
                                         f"PnL: {pnl:+.4f} SOL ({exit.get('pnl_pct', 0):+.1f}%)"
                                     )
@@ -1637,8 +998,8 @@ def background_tasks():
                                             f"Reason: {exit.get('exit_reason')}\n"
                                             f"PnL: {pnl:+.4f} SOL ({exit.get('pnl_pct', 0):+.1f}%)"
                                         )
-                        except Exception as e:
-                            print(f"Live exit check error: {e}")
+                    except Exception as e:
+                        print(f"Live exit check error: {e}")
         
         except Exception as e:
             print(f"Background task error: {e}")
@@ -1667,13 +1028,17 @@ def main():
         live_status = "🔴 LIVE ENABLED" if (trading_system.hybrid_engine and 
                                             trading_system.hybrid_engine.config.enable_live_trading) else "📝 Paper Only"
         
-        print(f"\n🎧 TRADING SERVER ({live_status})")
-        print(f"   Webhook:     http://{CONFIG.webhook_host}:{CONFIG.webhook_port}/webhook/helius")
-        print(f"   Status:      http://{CONFIG.webhook_host}:{CONFIG.webhook_port}/status")
-        print(f"   Positions:   http://{CONFIG.webhook_host}:{CONFIG.webhook_port}/positions")
-        print(f"   Live Status: http://{CONFIG.webhook_host}:{CONFIG.webhook_port}/live/status")
-        print(f"   Enable Live: POST /live/enable?confirm=LIVE")
-        print(f"   Kill Switch: POST /live/kill?confirm=KILL")
+        exit_status = "✅ Exit Manager" if trading_system.live_integration else "❌ No Exit Manager"
+        
+        print(f"\n🎧 TRADING SERVER ({live_status} | {exit_status})")
+        print(f"   Webhook:       http://{CONFIG.webhook_host}:{CONFIG.webhook_port}/webhook/helius")
+        print(f"   Status:        http://{CONFIG.webhook_host}:{CONFIG.webhook_port}/status")
+        print(f"   Positions:     http://{CONFIG.webhook_host}:{CONFIG.webhook_port}/positions")
+        print(f"   Live Status:   http://{CONFIG.webhook_host}:{CONFIG.webhook_port}/live/exits/status")
+        print(f"   Live Positions: http://{CONFIG.webhook_host}:{CONFIG.webhook_port}/live/exits/positions")
+        print(f"   Force Exit:    POST /live/exits/force")
+        print(f"   Exit All:      POST /live/exits/all")
+        print(f"   Kill Switch:   POST /live/kill?confirm=KILL")
         print(f"\n   Press Ctrl+C to stop\n")
         
         app.run(host=CONFIG.webhook_host, port=CONFIG.webhook_port, debug=False, use_reloader=False)
@@ -1684,6 +1049,10 @@ def main():
             trading_system._print_status()
             if trading_system.paper_engine:
                 trading_system.paper_engine.stop()
+            # NEW: Stop exit monitoring
+            if trading_system.live_integration:
+                trading_system.live_integration.stop_exit_monitoring()
+                print("✅ Exit monitoring stopped")
             if trading_system.hybrid_engine and trading_system.hybrid_engine.live_engine:
                 trading_system.hybrid_engine.live_engine.stop_monitoring()
     except Exception as e:

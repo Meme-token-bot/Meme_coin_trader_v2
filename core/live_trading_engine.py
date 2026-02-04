@@ -10,8 +10,8 @@ Builds on executioner_v1.py with enhancements:
 5. Kill switch with position liquidation
 
 CAPITAL: 3 SOL
-POSITION SIZE: 0.08 SOL (recommended)
-MAX POSITIONS: 10
+POSITION SIZE: 0.05 SOL (recommended)
+MAX POSITIONS: 2
 MAX DEPLOYED: 0.80 SOL (27% of capital)
 
 Author: Claude
@@ -131,9 +131,9 @@ class LiveTradingConfig:
     """Production configuration for 3 SOL capital"""
     
     # Capital management
-    starting_capital_sol: float = 3.0
-    position_size_sol: float = 0.30          # Per trade
-    max_open_positions: int = 10             # Max concurrent
+    starting_capital_sol: float = 2.5724235
+    position_size_sol: float = 0.05          # Per trade
+    max_open_positions: int = 2             # Max concurrent
     max_deployed_sol: float = 0.80           # Max SOL in positions
     fee_reserve_sol: float = 0.30            # Reserved for fees
     
