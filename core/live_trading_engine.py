@@ -1092,7 +1092,11 @@ class LiveTradingEngine:
                 return result
             
             # Calculate token amount in smallest unit
-            token_amount = int(tokens_held * (10 ** 6))  # Assume 6 decimals
+            decimals = self._get_token_decimals(token_address)
+            token_amount = int(Decimal(str(tokens_held)) * (10 ** decimals))
+            if token_amount <= 0:
+                result['error'] = "Token amount is too small to swap"
+                return result
             
             # Get Jupiter quote (sell token for SOL)
             quote = self._get_jupiter_quote(
@@ -1141,6 +1145,17 @@ class LiveTradingEngine:
             
             # Wait for confirmation
             confirmed = self._wait_for_confirmation(signature)
+
+            if not confirmed and not self.config.use_helius_sender:
+                fallback_swap = self._prepare_legacy_swap(swap_tx)
+                if fallback_swap:
+                    logger.warning("Exit not confirmed; retrying via Helius sender fallback.")
+                    fallback_sig = self._execute_via_helius_sender(fallback_swap)
+                    if fallback_sig:
+                        fallback_confirmed = self._wait_for_confirmation(fallback_sig)
+                        if fallback_confirmed:
+                            signature = fallback_sig
+                            confirmed = True
             
             if not confirmed:
                 result['error'] = "Transaction not confirmed"
@@ -1235,7 +1250,7 @@ class LiveTradingEngine:
             token_symbol = pos.get('token_symbol', 'UNKNOWN')
             entry_price = pos.get('entry_price_usd', 0)
             peak_price = pos.get('peak_price_usd', entry_price)
-            entry_time = datetime.fromisoformat(pos.get('entry_time', '').replace('Z', '+00:00'))
+            entry_time = self._parse_entry_time(pos.get('entry_time'))
             hours_held = (datetime.now(timezone.utc) - entry_time).total_seconds() / 3600
             
             # Get current price
@@ -1315,6 +1330,7 @@ class LiveTradingEngine:
             'quoteResponse': quote,
             'userPublicKey': self.wallet_pubkey,
             'wrapAndUnwrapSol': True,
+            'dynamicComputeUnitLimit': True,
             'prioritizationFeeLamports': self.config.priority_fee_lamports
         }
         if self.config.use_helius_sender:
@@ -1623,6 +1639,66 @@ class LiveTradingEngine:
                 time.sleep(2)
         
         return False
+    
+    def _parse_entry_time(self, entry_time_value: Any) -> datetime:
+        """Parse stored entry time safely, defaulting to now on bad data."""
+        if not entry_time_value:
+            logger.warning("Missing entry_time on position; defaulting to now.")
+            return datetime.now(timezone.utc)
+        if isinstance(entry_time_value, datetime):
+            if entry_time_value.tzinfo is None:
+                return entry_time_value.replace(tzinfo=timezone.utc)
+            return entry_time_value
+        if isinstance(entry_time_value, str):
+            cleaned = entry_time_value.replace('Z', '+00:00')
+            try:
+                return datetime.fromisoformat(cleaned)
+            except ValueError:
+                logger.warning(f"Invalid entry_time format '{entry_time_value}'; defaulting to now.")
+                return datetime.now(timezone.utc)
+        logger.warning(f"Unsupported entry_time type {type(entry_time_value)}; defaulting to now.")
+        return datetime.now(timezone.utc)
+
+    def _get_token_decimals(self, mint: str) -> int:
+        """Fetch token decimals from RPC (cached)."""
+        if not hasattr(self, "_token_decimals_cache"):
+            self._token_decimals_cache = {}
+        if mint in self._token_decimals_cache:
+            return self._token_decimals_cache[mint]
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getTokenSupply",
+            "params": [mint],
+        }
+        try:
+            response = requests.post(self.rpc_url, json=payload, timeout=20)
+            response.raise_for_status()
+            result = response.json().get("result", {})
+            value = result.get("value", {})
+            decimals = value.get("decimals")
+            if decimals is None:
+                raise RuntimeError("Missing decimals in RPC response.")
+            decimals_int = int(decimals)
+            self._token_decimals_cache[mint] = decimals_int
+            return decimals_int
+        except Exception as exc:
+            logger.warning(f"Failed to fetch decimals for {mint}: {exc}. Defaulting to 6.")
+            return 6
+
+    def _prepare_legacy_swap(self, swap_tx_base64: str) -> Optional[str]:
+        """Ensure a swap transaction is legacy encoded for Helius sender."""
+        try:
+            tx_bytes = base64.b64decode(swap_tx_base64)
+            try:
+                legacy_tx = Transaction.from_bytes(tx_bytes)
+            except Exception:
+                versioned_tx = VersionedTransaction.from_bytes(tx_bytes)
+                legacy_tx = self._build_legacy_from_versioned(versioned_tx)
+            return base64.b64encode(bytes(legacy_tx)).decode("utf-8")
+        except Exception as exc:
+            logger.error(f"Failed to prepare legacy swap: {exc}")
+            return None
     
     def _trigger_cool_down(self):
         """Trigger cool down period"""
