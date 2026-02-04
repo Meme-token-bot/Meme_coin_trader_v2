@@ -430,7 +430,24 @@ class FixedPaperTradingEngine:
         return self._trader.get_open_positions()
     
     def get_stats(self) -> Dict:
-        return self._trader.get_stats()
+        if hasattr(self._trader, "get_stats"):
+            return self._trader.get_stats()
+
+        summary = (
+            self._trader.get_performance_summary()
+            if hasattr(self._trader, "get_performance_summary")
+            else {}
+        )
+        return {
+            'balance': summary.get('balance', getattr(self._trader, 'balance', 0)),
+            'starting_balance': summary.get('starting_balance', getattr(self._trader, 'starting_balance', 0)),
+            'total_pnl': summary.get('total_pnl_sol', getattr(self._trader, 'total_pnl', 0)),
+            'return_pct': summary.get('return_pct', 0),
+            'open_positions': summary.get('open_positions', getattr(self._trader, 'open_position_count', 0)),
+            'max_positions': summary.get('max_positions', getattr(self._trader, 'max_open_positions', 0)),
+            'total_trades': summary.get('total_trades', getattr(self._trader, 'total_trades', 0)),
+            'win_rate': summary.get('win_rate', 0),
+        }
     
     def get_full_status(self) -> Dict:
         return {
