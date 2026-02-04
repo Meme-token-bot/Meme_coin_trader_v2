@@ -1472,6 +1472,20 @@ class RobustPaperTrader:
                 SELECT * FROM paper_positions_v6 WHERE status = 'open'
             """).fetchall()
             return [dict(r) for r in rows]
+
+    def get_stats(self) -> Dict:
+        """Get trading statistics for status displays."""
+        summary = self.get_performance_summary()
+        return {
+            'balance': summary.get('balance', 0),
+            'starting_balance': summary.get('starting_balance', 0),
+            'total_pnl': summary.get('total_pnl_sol', 0),
+            'return_pct': summary.get('return_pct', 0),
+            'open_positions': summary.get('open_positions', 0),
+            'max_positions': summary.get('max_positions', self.max_open_positions),
+            'total_trades': summary.get('total_trades', 0),
+            'win_rate': summary.get('win_rate', 0),
+        }
     
     def get_performance_summary(self) -> Dict:
         """Get performance summary"""
