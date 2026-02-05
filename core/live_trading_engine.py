@@ -147,10 +147,12 @@ class LiveTradingConfig:
     cool_down_minutes: int = 30              # After consecutive losses
     
     # Execution
-    default_slippage_bps: int = 150          # 1.5% slippage
-    max_slippage_bps: int = 300              # 3% max
+    default_slippage_bps: int = 300          # 3% slippage
+    max_slippage_bps: int = 500              # 5% max
     jito_tip_lamports: int = 1_000_000       # 0.001 SOL tip
-    priority_fee_lamports: int = 50_000      # Priority fee
+    priority_fee_lamports: int = 100_000     # Priority fee
+    helius_sender_retry_seconds: int = 12    # Retry window for Helius sender
+    helius_sender_retry_interval: float = 2  # Seconds between retries
     confirmation_timeout: int = 60           # Seconds
     retry_attempts: int = 2
     
@@ -693,6 +695,30 @@ class LiveTradingEngine:
             self.config.enable_live_trading = get_secret('ENABLE_LIVE_TRADING', '').lower() == 'true'
         if not self.config.use_helius_sender:
             self.config.use_helius_sender = get_secret('USE_HELIUS_SENDER', '').lower() == 'true'
+        slippage_override = get_secret('DEFAULT_SLIPPAGE_BPS')
+        if slippage_override:
+            try:
+                self.config.default_slippage_bps = int(slippage_override)
+            except ValueError:
+                logger.warning(f"Invalid DEFAULT_SLIPPAGE_BPS: {slippage_override}")
+        priority_override = get_secret('PRIORITY_FEE_LAMPORTS')
+        if priority_override:
+            try:
+                self.config.priority_fee_lamports = int(priority_override)
+            except ValueError:
+                logger.warning(f"Invalid PRIORITY_FEE_LAMPORTS: {priority_override}")
+        retry_seconds_override = get_secret('HELIUS_SENDER_RETRY_SECONDS')
+        if retry_seconds_override:
+            try:
+                self.config.helius_sender_retry_seconds = int(retry_seconds_override)
+            except ValueError:
+                logger.warning(f"Invalid HELIUS_SENDER_RETRY_SECONDS: {retry_seconds_override}")
+        retry_interval_override = get_secret('HELIUS_SENDER_RETRY_INTERVAL')
+        if retry_interval_override:
+            try:
+                self.config.helius_sender_retry_interval = float(retry_interval_override)
+            except ValueError:
+                logger.warning(f"Invalid HELIUS_SENDER_RETRY_INTERVAL: {retry_interval_override}")
         if self.config.use_helius_sender:
             self.config.enable_jito_bundles = False
         self.price_service = PriceService()
@@ -1533,6 +1559,20 @@ class LiveTradingEngine:
         except Exception as e:
             logger.error(f"Helius sender execution error: {e}")
 
+        return None
+    
+    def _execute_via_helius_sender_with_retries(self, swap_tx_base64: str) -> Optional[str]:
+        """Retry Helius sender submissions to improve landing rate."""
+        deadline = time.time() + max(self.config.helius_sender_retry_seconds, 0)
+        attempt = 0
+        while time.time() <= deadline or attempt == 0:
+            attempt += 1
+            signature = self._execute_via_helius_sender(swap_tx_base64)
+            if signature:
+                return signature
+            if self.config.helius_sender_retry_interval <= 0:
+                break
+            time.sleep(self.config.helius_sender_retry_interval)
         return None
 
     def _inject_helius_tip(self, tx: Transaction) -> Transaction:
