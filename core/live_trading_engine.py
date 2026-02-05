@@ -1264,7 +1264,8 @@ class LiveTradingEngine:
             
             # Update peak price
             if current_price > peak_price:
-                self.tax_db.update_position_peak(token_address, current_price)
+                if hasattr(self.tax_db, "update_position_peak"):
+                    self.tax_db.update_position_peak(token_address, current_price)
                 peak_price = current_price
             
             # Calculate P&L

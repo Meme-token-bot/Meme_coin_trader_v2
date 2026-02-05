@@ -237,7 +237,8 @@ class LiveExitManager:
         # 5. Update peak price
         new_peak = max(peak_price, current_price)
         if new_peak > peak_price:
-            self.tax_db.update_position_peak(token_address, new_peak)
+            if hasattr(self.tax_db, "update_position_peak"):
+                self.tax_db.update_position_peak(token_address, new_peak)
             peak_price = new_peak
         
         metrics['peak_price'] = peak_price
