@@ -148,12 +148,12 @@ class LiveTradingConfig:
     # Execution
     default_slippage_bps: int = 300          # 3% slippage
     max_slippage_bps: int = 500              # 5% max
-    jito_tip_lamports: int = 3_000_000       # 0.001 SOL tip
+    jito_tip_lamports: int = 5_000_000       # 0.001 SOL tip
     priority_fee_lamports: int = 100_000     # Priority fee
     enable_dynamic_priority_fees: bool = True  # Fetch priority fees from RPC
-    priority_fee_level: str = "veryHigh"    # low/medium/high/veryHigh/unsafeMax
-    min_priority_fee_lamports: int = 50_000 # Floor when dynamic fees enabled
-    max_priority_fee_lamports: int = 5_000_000 # Ceiling when dynamic fees enabled
+    priority_fee_level: str = "unsafeMax"    # low/medium/high/veryHigh/unsafeMax
+    min_priority_fee_lamports: int = 200_000 # Floor when dynamic fees enabled
+    max_priority_fee_lamports: int = 10_000_000 # Ceiling when dynamic fees enabled
     dynamic_compute_unit_limit: bool = True # Let Jupiter size CU automatically
     compute_unit_limit: Optional[int] = None # Explicit CU limit if set
     helius_sender_retry_seconds: int = 12    # Retry window for Helius sender
@@ -1462,8 +1462,9 @@ class LiveTradingEngine:
             'quoteResponse': quote,
             'userPublicKey': self.wallet_pubkey,
             'wrapAndUnwrapSol': True,
-            'dynamicComputeUnitLimit': self.config.dynamic_compute_unit_limit,
-            'prioritizationFeeLamports': priority_fee_lamports
+            'dynamicComputeUnitLimit': True,
+            'prioritizationFeeLamports': priority_fee_lamports,
+            'dynamicSlippage': {"maxBps": 500},  # ADD: let Jupiter optimize slippage
         }
         if self.config.compute_unit_limit:
             payload['computeUnitLimit'] = self.config.compute_unit_limit
@@ -1617,20 +1618,32 @@ class LiveTradingEngine:
         return None
     
     def _prepare_helius_signed_tx(self, swap_tx_base64: str) -> Optional[str]:
-        """Prepare a signed legacy transaction for Helius sender submissions."""
+    try:
+        tx_bytes = base64.b64decode(swap_tx_base64)
         try:
-            tx_bytes = base64.b64decode(swap_tx_base64)
-            try:
-                tx = Transaction.from_bytes(tx_bytes)
-            except Exception:
-                versioned_tx = VersionedTransaction.from_bytes(tx_bytes)
-                tx = self._build_legacy_from_versioned(versioned_tx)
-            tx = self._inject_helius_tip(tx)
-            tx.sign([self.keypair], tx.message.recent_blockhash)
-            return base64.b64encode(bytes(tx)).decode("utf-8")
-        except Exception as e:
-            logger.error(f"Helius sender signing error: {e}")
-            return None
+            tx = Transaction.from_bytes(tx_bytes)
+        except Exception:
+            versioned_tx = VersionedTransaction.from_bytes(tx_bytes)
+            tx = self._build_legacy_from_versioned(versioned_tx)
+        tx = self._inject_helius_tip(tx)
+
+        # CRITICAL FIX: Fetch a FRESH blockhash before signing
+        blockhash_resp = self.solana_client.get_latest_blockhash()
+        fresh_blockhash = blockhash_resp.value.blockhash
+
+        # Rebuild message with fresh blockhash
+        new_message = Message.new_with_blockhash(
+            list(self._compiled_to_instructions(tx.message)[0]),  # instructions
+            self.keypair.pubkey(),                                  # payer
+            fresh_blockhash                                         # FRESH
+        )
+        tx = Transaction.new_unsigned(new_message)
+        tx.sign([self.keypair], fresh_blockhash)
+
+        return base64.b64encode(bytes(tx)).decode("utf-8")
+    except Exception as e:
+        logger.error(f"Helius sender signing error: {e}")
+        return None
 
     def _send_helius_signed_tx(self, signed_tx_base64: str) -> Optional[str]:
         """Send a signed legacy transaction via Helius sender."""
@@ -1652,7 +1665,7 @@ class LiveTradingEngine:
             "method": "sendTransaction",
             "params": [
                 signed_tx_base64,
-                {"encoding": "base64", "skipPreflight": True, "maxRetries": 0}
+                {"encoding": "base64", "skipPreflight": True, "maxRetries": 5}
             ]
         }
         headers = {
@@ -1826,9 +1839,9 @@ class LiveTradingEngine:
         signature: str,
         signed_tx_base64: Optional[str] = None,
         timeout: int = None,
-        spam_interval: float = 0.3,
-        spam_duration: float = 12.0,
-        status_interval: float = 0.6,
+        spam_interval: float = 0.4,
+        spam_duration: float = 8.0,
+        status_interval: float = 0.5,
     ) -> bool:
         """Wait for transaction confirmation with optional resend spamming."""
         timeout = timeout or self.config.confirmation_timeout

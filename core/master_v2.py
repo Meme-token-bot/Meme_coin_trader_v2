@@ -766,6 +766,9 @@ class TradingSystem:
             or chosen_transfer.get('tokenSymbol')
             or 'UNKNOWN'
         )
+        if self._already_in_token(token_address):
+            logger.info(f"⏭️ Already in {token_symbol} — skipping duplicate entry")
+            return
         price = token_info.get('price_usd', 0) or token_info.get('price_native', 0)
         if price <= 0:
             self.diagnostics.parse_failures += 1
@@ -796,6 +799,9 @@ class TradingSystem:
             self.diagnostics.high_conviction_signals += 1
 
         if decision.get('should_enter'):
+            if self._already_in_token(token_address):
+                self.diagnostics.position_limit_skips += 1
+                return
             conviction_score = decision.get('conviction_score', 0)
             signal['conviction_score'] = conviction_score
             signal['conviction'] = conviction_score  # Backup key
@@ -834,6 +840,19 @@ class TradingSystem:
             token=token_address,
         )
 
+    def _already_in_token(self, token_address: str) -> bool:
+        """Check if we already have an open position in this token."""
+        if self.paper_engine:
+            open_positions = self.paper_engine.get_open_positions()
+            for pos in open_positions:
+                if pos.get('token_address') == token_address:
+                    return True
+        if self.hybrid_engine and self.hybrid_engine.live_engine:
+            live_positions = self.hybrid_engine.live_engine.get_open_positions()
+            for pos in live_positions:
+                if pos.get('token_address') == token_address:
+                    return True
+        return False
 
 # ============================================================================
 # FLASK APP
