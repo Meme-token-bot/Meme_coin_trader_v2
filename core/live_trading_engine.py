@@ -194,7 +194,7 @@ class PriceService:
     
     def __init__(self):
         self._cache = {}
-        self._cache_ttl = 30  # seconds
+        self._cache_ttl = 2  # seconds
         self._sol_nzd_rate = None
         self._sol_usd_rate = None
         self._last_sol_update = None
