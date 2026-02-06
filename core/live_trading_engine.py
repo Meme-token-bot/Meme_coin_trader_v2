@@ -820,6 +820,7 @@ class LiveTradingEngine:
             self.config.enable_jito_bundles = False
         self.price_service = PriceService()
         self.tax_db = TaxDatabase("live_trades_tax.db")
+        self._last_sender_tip_error = False
         self.helius_key = helius_key or get_secret('HELIUS_KEY')
         exit_config = ExitConfig(
             price_check_interval_seconds=self.config.exit_monitor_interval_seconds,
@@ -1667,11 +1668,20 @@ class LiveTradingEngine:
         if not signed_tx_base64:
             return None, None
 
+        self._last_sender_tip_error = False
         signature = self._send_helius_signed_tx(signed_tx_base64) if use_sender else self._send_signed_tx_via_rpc(signed_tx_base64)
         if signature:
             via = "Helius sender" if use_sender else "standard RPC"
             logger.info(f"📤 {via} accepted: {signature[:32]}...")
             return signature, signed_tx_base64
+
+        if use_sender and self._last_sender_tip_error:
+            logger.warning("⚠️ Helius sender rejected tx for missing tip; falling back to standard RPC for this swap.")
+            fallback_sig = self._send_signed_tx_via_rpc(signed_tx_base64)
+            if fallback_sig:
+                logger.info(f"📤 standard RPC fallback accepted: {fallback_sig[:32]}...")
+                return fallback_sig, signed_tx_base64
+
         return None, None
     
     def _execute_direct_rpc(self, swap_tx_base64: str) -> Tuple[Optional[str], Optional[str]]:
@@ -1786,11 +1796,17 @@ class LiveTradingEngine:
         try:
             resp = requests.post(sender_url, json=payload, headers=headers, timeout=30)
             if resp.status_code != 200:
-                logger.error(f"Helius sender HTTP error: {resp.status_code} - {resp.text[:200]}")
+                body_snippet = (resp.text or "")[:400]
+                if "transaction must send a tip of at least" in body_snippet.lower():
+                    self._last_sender_tip_error = True
+                logger.error(f"Helius sender HTTP error: {resp.status_code} - {body_snippet}")
                 return None
             result = resp.json()
             if "result" in result:
                 return str(result["result"])
+            error_blob = str(result.get('error'))
+            if "transaction must send a tip of at least" in error_blob.lower():
+                self._last_sender_tip_error = True
             logger.error(f"Helius sender error: {result.get('error')}")
         except Exception as e:
             logger.error(f"Helius sender execution error: {e}")
