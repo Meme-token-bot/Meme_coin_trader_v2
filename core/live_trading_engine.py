@@ -816,6 +816,12 @@ class LiveTradingEngine:
                 self.config.helius_sender_retry_interval = float(retry_interval_override)
             except ValueError:
                 logger.warning(f"Invalid HELIUS_SENDER_RETRY_INTERVAL: {retry_interval_override}")
+        sender_tip_override = get_secret('HELIUS_SENDER_TIP_LAMPORTS')
+        if sender_tip_override:
+            try:
+                self.config.helius_sender_tip_lamports = int(sender_tip_override)
+            except ValueError:
+                logger.warning(f"Invalid HELIUS_SENDER_TIP_LAMPORTS: {sender_tip_override}")
         if self.config.use_helius_sender and self.config.use_helius_sender_for_buys:
             self.config.enable_jito_bundles = False
         self.price_service = PriceService()
@@ -1094,7 +1100,8 @@ class LiveTradingEngine:
                 return result
             
             # Get swap transaction
-            swap_tx = self._get_jupiter_swap(quote)
+            use_sender = self.config.use_helius_sender and self.config.use_helius_sender_for_buys
+            swap_tx = self._get_jupiter_swap(quote, as_legacy=use_sender)
             
             if not swap_tx:
                 result['error'] = "Failed to get swap transaction"
@@ -1103,7 +1110,6 @@ class LiveTradingEngine:
             
             # Execute via configured transport (Helius sender or standard RPC).
             signed_payload = None
-            use_sender = self.config.use_helius_sender and self.config.use_helius_sender_for_buys
             signature, signed_payload = self._execute_swap_transport(swap_tx, use_sender=use_sender)
             
             if not signature:
@@ -1251,7 +1257,8 @@ class LiveTradingEngine:
                 return result
             
             # Get swap transaction
-            swap_tx = self._get_jupiter_swap(quote)
+            use_sender = self.config.use_helius_sender and self.config.use_helius_sender_for_sells
+            swap_tx = self._get_jupiter_swap(quote, as_legacy=use_sender)
             
             if not swap_tx:
                 result['error'] = "Failed to get swap transaction"
@@ -1259,7 +1266,6 @@ class LiveTradingEngine:
             
             # Execute via configured transport (Helius sender or standard RPC).
             signed_payload = None
-            use_sender = self.config.use_helius_sender and self.config.use_helius_sender_for_sells
             signature, signed_payload = self._execute_swap_transport(swap_tx, use_sender=use_sender)
             
             if not signature:
@@ -1279,7 +1285,10 @@ class LiveTradingEngine:
                     slippage_bps=self.config.default_slippage_bps
                 )
                 if retry_quote:
-                    retry_swap = self._get_jupiter_swap(retry_quote)
+                    retry_swap = self._get_jupiter_swap(
+                        retry_quote,
+                        as_legacy=(self.config.use_helius_sender and self.config.use_helius_sender_for_sells),
+                    )
                     if retry_swap:
                         retry_sig, retry_payload = self._execute_swap_transport(
                             retry_swap,
@@ -1664,7 +1673,14 @@ class LiveTradingEngine:
 
     def _execute_swap_transport(self, swap_tx_base64: str, use_sender: bool) -> Tuple[Optional[str], Optional[str]]:
         """Sign Jupiter tx and submit via Helius sender or standard RPC."""
-        signed_tx_base64 = self._sign_swap_transaction_base64(swap_tx_base64)
+        signed_tx_base64 = None
+        if use_sender:
+            signed_tx_base64 = self._prepare_helius_signed_tx(swap_tx_base64)
+            if not signed_tx_base64:
+                logger.warning("Sender tx preparation failed; falling back to standard RPC signing path.")
+                signed_tx_base64 = self._sign_swap_transaction_base64(swap_tx_base64)
+        else:
+            signed_tx_base64 = self._sign_swap_transaction_base64(swap_tx_base64)
         if not signed_tx_base64:
             return None, None
 
@@ -1738,24 +1754,24 @@ class LiveTradingEngine:
             traceback.print_exc()
             return None, None
     
+    def _prepare_helius_signed_tx(self, swap_tx_base64: str) -> Optional[str]:
+        """Prepare a signed legacy tx with mandatory Helius tip for sender endpoint."""
         try:
             tx_bytes = base64.b64decode(swap_tx_base64)
             try:
                 tx = Transaction.from_bytes(tx_bytes)
+                tx = self._inject_helius_tip(tx)
             except Exception:
                 versioned_tx = VersionedTransaction.from_bytes(tx_bytes)
                 tx = self._build_legacy_from_versioned(versioned_tx)
-            tx = self._inject_helius_tip(tx)
 
-            # CRITICAL FIX: Fetch a FRESH blockhash before signing
             blockhash_resp = self.solana_client.get_latest_blockhash()
             fresh_blockhash = blockhash_resp.value.blockhash
 
-            # Rebuild message with fresh blockhash
             new_message = Message.new_with_blockhash(
-                list(self._compiled_to_instructions(tx.message)[0]),  # instructions
-                self.keypair.pubkey(),                                  # payer
-                fresh_blockhash                                         # FRESH
+                list(self._compiled_to_instructions(tx.message)[0]),
+                self.keypair.pubkey(),
+                fresh_blockhash,
             )
             tx = Transaction.new_unsigned(new_message)
             tx.sign([self.keypair], fresh_blockhash)
@@ -1870,7 +1886,7 @@ class LiveTradingEngine:
 
     def _build_helius_tip_instruction(self) -> Instruction:
         tip_pubkey = Pubkey.from_string(random.choice(HELIUS_TIP_ACCOUNTS))
-        tip_lamports = max(self.config.jito_tip_lamports, 200_000)
+        tip_lamports = max(self.config.helius_sender_tip_lamports, 200_000)
         return transfer(
             TransferParams(
                 from_pubkey=self.keypair.pubkey(),
