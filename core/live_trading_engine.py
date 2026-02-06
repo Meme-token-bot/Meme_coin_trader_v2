@@ -1100,13 +1100,9 @@ class LiveTradingEngine:
                 self.tax_db.log_execution('BUY', token_address, token_symbol, 'FAILED', error=result['error'])
                 return result
             
-            # Execute via Jito or regular RPC
+            # Execute: fresh blockhash + sign + send via standard RPC (no tip needed)
             signed_payload = None
-            use_helius_for_buy = self.config.use_helius_sender or self.config.use_helius_sender_for_buys
-            if self.config.enable_jito_bundles and self.jito and not use_helius_for_buy:
-                signature = self._execute_via_rpc(swap_tx)
-            elif use_helius_for_buy:
-                signature, signed_payload = self._execute_via_helius_sender_with_payload(swap_tx)
+            signature, signed_payload = self._execute_direct_rpc(swap_tx)
             
             if not signature:
                 result['error'] = "Transaction failed"
@@ -1261,13 +1257,7 @@ class LiveTradingEngine:
             
             # Execute
             signed_payload = None
-            use_helius_for_sell = self.config.use_helius_sender or self.config.use_helius_sender_for_sells
-            if use_helius_for_sell:
-                signature, signed_payload = self._execute_via_helius_sender_with_payload(swap_tx)
-            elif self.config.enable_jito_bundles and self.jito:
-                signature = self._execute_via_jito(swap_tx)
-            else:
-                signature = self._execute_via_rpc(swap_tx)
+            signature, signed_payload = self._execute_direct_rpc(swap_tx)
             
             if not signature:
                 result['error'] = "Transaction failed"
@@ -1276,16 +1266,24 @@ class LiveTradingEngine:
             # Wait for confirmation
             confirmed = self._wait_for_confirmation(signature, signed_payload)
 
-            if not confirmed and not use_helius_for_sell:
-                fallback_swap = self._prepare_legacy_swap(swap_tx)
-                if fallback_swap:
-                    logger.warning("Exit not confirmed; retrying via Helius sender fallback.")
-                    fallback_sig, fallback_payload = self._execute_via_helius_sender_with_payload(fallback_swap)
-                    if fallback_sig:
-                        fallback_confirmed = self._wait_for_confirmation(fallback_sig, fallback_payload)
-                        if fallback_confirmed:
-                            signature = fallback_sig
-                            confirmed = True
+            if not confirmed:
+                # Retry: get a new quote and try again
+                logger.warning("Exit not confirmed; retrying with fresh quote...")
+                retry_quote = self._get_jupiter_quote(
+                    input_mint=token_address,
+                    output_mint=SOL_MINT,
+                    amount=token_amount,
+                    slippage_bps=self.config.default_slippage_bps
+                )
+                if retry_quote:
+                    retry_swap = self._get_jupiter_swap(retry_quote)
+                    if retry_swap:
+                        retry_sig, retry_payload = self._execute_direct_rpc(retry_swap)
+                        if retry_sig:
+                            retry_confirmed = self._wait_for_confirmation(retry_sig, retry_payload)
+                            if retry_confirmed:
+                                signature = retry_sig
+                                confirmed = True
             
             if not confirmed:
                 result['error'] = "Transaction not confirmed"
@@ -1464,13 +1462,12 @@ class LiveTradingEngine:
             'wrapAndUnwrapSol': True,
             'dynamicComputeUnitLimit': True,
             'prioritizationFeeLamports': priority_fee_lamports,
-            'dynamicSlippage': {"maxBps": 500},  # ADD: let Jupiter optimize slippage
+            'dynamicSlippage': {"maxBps": 1500},
+            'asLegacyTransaction': True,
+            'useSharedAccounts': False,
         }
         if self.config.compute_unit_limit:
             payload['computeUnitLimit'] = self.config.compute_unit_limit
-        if self.config.use_helius_sender:
-            payload['asLegacyTransaction'] = True
-            payload['useSharedAccounts'] = False
         metis_url = get_secret('QUICKNODE_METIS_URL')
         if metis_url:
             metis_url = metis_url.rstrip('/')
@@ -1617,7 +1614,60 @@ class LiveTradingEngine:
         
         return None
     
-    def _prepare_helius_signed_tx(self, swap_tx_base64: str) -> Optional[str]:
+    def _execute_direct_rpc(self, swap_tx_base64: str) -> Tuple[Optional[str], Optional[str]]:
+        """Execute a swap via standard Helius RPC with fresh blockhash.
+        
+        This avoids the Helius sender (which requires a tip instruction that
+        forces decompiling and rebuilding the message, corrupting account metadata).
+        
+        Instead: replace blockhash bytes directly in Jupiter's serialized message,
+        preserving ALL instructions and account flags exactly as Jupiter built them.
+        Send via standard RPC sendTransaction which has no tip requirement.
+        """
+        try:
+            tx_bytes = base64.b64decode(swap_tx_base64)
+            
+            # Parse as legacy transaction
+            tx = Transaction.from_bytes(tx_bytes)
+            message = tx.message
+            
+            # Fetch fresh blockhash
+            blockhash_resp = self.solana_client.get_latest_blockhash()
+            fresh_blockhash = blockhash_resp.value.blockhash
+            
+            # Replace blockhash directly in serialized message bytes
+            msg_bytes = bytearray(bytes(message))
+            old_bh_bytes = bytes(message.recent_blockhash)
+            pos = msg_bytes.find(old_bh_bytes)
+            if pos == -1:
+                logger.error("Could not locate blockhash in message bytes")
+                return None, None
+            
+            msg_bytes[pos:pos+32] = bytes(fresh_blockhash)
+            new_message = Message.from_bytes(bytes(msg_bytes))
+            new_tx = Transaction.new_unsigned(new_message)
+            new_tx.sign([self.keypair], fresh_blockhash)
+            
+            # Send via standard RPC (no tip required)
+            from solana.rpc.types import TxOpts
+            opts = TxOpts(skip_preflight=True, max_retries=5)
+            resp = self.solana_client.send_transaction(new_tx, opts=opts)
+            
+            if resp.value:
+                sig = str(resp.value)
+                signed_b64 = base64.b64encode(bytes(new_tx)).decode("utf-8")
+                logger.info(f"📤 RPC accepted: {sig[:32]}... (blockhash={str(fresh_blockhash)[:16]}...)")
+                return sig, signed_b64
+            else:
+                logger.error(f"RPC send failed: {resp}")
+                return None, None
+                
+        except Exception as e:
+            logger.error(f"Direct RPC execution error: {e}")
+            import traceback
+            traceback.print_exc()
+            return None, None
+    
         try:
             tx_bytes = base64.b64decode(swap_tx_base64)
             try:
@@ -1858,7 +1908,14 @@ class LiveTradingEngine:
             now = time.monotonic()
 
             if signed_tx_base64 and now <= spam_until and now >= next_spam:
-                self._send_helius_signed_tx(signed_tx_base64)
+                try:
+                    # Resend via standard RPC
+                    resend_bytes = base64.b64decode(signed_tx_base64)
+                    resend_tx = Transaction.from_bytes(resend_bytes)
+                    from solana.rpc.types import TxOpts
+                    self.solana_client.send_transaction(resend_tx, opts=TxOpts(skip_preflight=True))
+                except Exception:
+                    pass  # Resend failures are expected, don't log
                 next_spam = now + max(spam_interval, 0.05)
 
             if now >= next_status:
@@ -1868,8 +1925,14 @@ class LiveTradingEngine:
                     if statuses and statuses[0]:
                         status = statuses[0]
                         conf_status = str(status.confirmation_status)
+                        elapsed = now - start
                         if 'confirmed' in conf_status.lower() or 'finalized' in conf_status.lower():
-                            return status.err is None
+                            if status.err is None:
+                                logger.info(f"✅ TX CONFIRMED ({conf_status}) in {elapsed:.1f}s")
+                                return True
+                            else:
+                                logger.error(f"❌ TX ON-CHAIN ERROR: {status.err}")
+                                return False
                 except Exception as e:
                     logger.warning(f"Confirmation check error: {e}")
 
@@ -1877,6 +1940,7 @@ class LiveTradingEngine:
 
             time.sleep(0.05)
         
+        logger.warning(f"⏱️ TX TIMEOUT ({timeout}s): {signature[:32]}...")
         return False
     
     def _parse_entry_time(self, entry_time_value: Any) -> datetime:
