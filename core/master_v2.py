@@ -847,11 +847,8 @@ class TradingSystem:
             for pos in open_positions:
                 if pos.get('token_address') == token_address:
                     return True
-        if self.hybrid_engine and self.hybrid_engine.live_engine:
-            live_positions = self.hybrid_engine.live_engine.get_open_positions()
-            for pos in live_positions:
-                if pos.get('token_address') == token_address:
-                    return True
+        # Note: LiveTradingEngine does not have get_open_positions().
+        # Paper engine is the source of truth for all open positions.
         return False
 
 # ============================================================================
