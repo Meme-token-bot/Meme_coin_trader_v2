@@ -1618,32 +1618,32 @@ class LiveTradingEngine:
         return None
     
     def _prepare_helius_signed_tx(self, swap_tx_base64: str) -> Optional[str]:
-    try:
-        tx_bytes = base64.b64decode(swap_tx_base64)
         try:
-            tx = Transaction.from_bytes(tx_bytes)
-        except Exception:
-            versioned_tx = VersionedTransaction.from_bytes(tx_bytes)
-            tx = self._build_legacy_from_versioned(versioned_tx)
-        tx = self._inject_helius_tip(tx)
+            tx_bytes = base64.b64decode(swap_tx_base64)
+            try:
+                tx = Transaction.from_bytes(tx_bytes)
+            except Exception:
+                versioned_tx = VersionedTransaction.from_bytes(tx_bytes)
+                tx = self._build_legacy_from_versioned(versioned_tx)
+            tx = self._inject_helius_tip(tx)
 
-        # CRITICAL FIX: Fetch a FRESH blockhash before signing
-        blockhash_resp = self.solana_client.get_latest_blockhash()
-        fresh_blockhash = blockhash_resp.value.blockhash
+            # CRITICAL FIX: Fetch a FRESH blockhash before signing
+            blockhash_resp = self.solana_client.get_latest_blockhash()
+            fresh_blockhash = blockhash_resp.value.blockhash
 
-        # Rebuild message with fresh blockhash
-        new_message = Message.new_with_blockhash(
-            list(self._compiled_to_instructions(tx.message)[0]),  # instructions
-            self.keypair.pubkey(),                                  # payer
-            fresh_blockhash                                         # FRESH
-        )
-        tx = Transaction.new_unsigned(new_message)
-        tx.sign([self.keypair], fresh_blockhash)
+            # Rebuild message with fresh blockhash
+            new_message = Message.new_with_blockhash(
+                list(self._compiled_to_instructions(tx.message)[0]),  # instructions
+                self.keypair.pubkey(),                                  # payer
+                fresh_blockhash                                         # FRESH
+            )
+            tx = Transaction.new_unsigned(new_message)
+            tx.sign([self.keypair], fresh_blockhash)
 
-        return base64.b64encode(bytes(tx)).decode("utf-8")
-    except Exception as e:
-        logger.error(f"Helius sender signing error: {e}")
-        return None
+            return base64.b64encode(bytes(tx)).decode("utf-8")
+        except Exception as e:
+            logger.error(f"Helius sender signing error: {e}")
+            return None
 
     def _send_helius_signed_tx(self, signed_tx_base64: str) -> Optional[str]:
         """Send a signed legacy transaction via Helius sender."""
