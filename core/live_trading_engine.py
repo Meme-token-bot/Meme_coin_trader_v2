@@ -151,6 +151,10 @@ class LiveTradingConfig:
     max_slippage_bps: int = 500              # 5% max
     jito_tip_lamports: int = 1_000_000       # 0.001 SOL tip
     priority_fee_lamports: int = 100_000     # Priority fee
+    enable_dynamic_priority_fees: bool = False  # Fetch priority fees from RPC
+    priority_fee_level: str = "high"        # low/medium/high/veryHigh/unsafeMax
+    min_priority_fee_lamports: int = 10_000 # Floor when dynamic fees enabled
+    max_priority_fee_lamports: int = 2_000_000 # Ceiling when dynamic fees enabled
     helius_sender_retry_seconds: int = 12    # Retry window for Helius sender
     helius_sender_retry_interval: float = 2  # Seconds between retries
     confirmation_timeout: int = 60           # Seconds
@@ -707,6 +711,24 @@ class LiveTradingEngine:
                 self.config.priority_fee_lamports = int(priority_override)
             except ValueError:
                 logger.warning(f"Invalid PRIORITY_FEE_LAMPORTS: {priority_override}")
+        dynamic_fee_override = get_secret('ENABLE_DYNAMIC_PRIORITY_FEES')
+        if dynamic_fee_override:
+            self.config.enable_dynamic_priority_fees = dynamic_fee_override.lower() == 'true'
+        fee_level_override = get_secret('PRIORITY_FEE_LEVEL')
+        if fee_level_override:
+            self.config.priority_fee_level = fee_level_override
+        min_fee_override = get_secret('MIN_PRIORITY_FEE_LAMPORTS')
+        if min_fee_override:
+            try:
+                self.config.min_priority_fee_lamports = int(min_fee_override)
+            except ValueError:
+                logger.warning(f"Invalid MIN_PRIORITY_FEE_LAMPORTS: {min_fee_override}")
+        max_fee_override = get_secret('MAX_PRIORITY_FEE_LAMPORTS')
+        if max_fee_override:
+            try:
+                self.config.max_priority_fee_lamports = int(max_fee_override)
+            except ValueError:
+                logger.warning(f"Invalid MAX_PRIORITY_FEE_LAMPORTS: {max_fee_override}")
         retry_seconds_override = get_secret('HELIUS_SENDER_RETRY_SECONDS')
         if retry_seconds_override:
             try:
@@ -1343,12 +1365,13 @@ class LiveTradingEngine:
     
     def _get_jupiter_swap(self, quote: Dict) -> Optional[str]:
         """Get swap transaction from Jupiter"""
+        priority_fee_lamports = self._get_priority_fee_lamports()
         payload = {
             'quoteResponse': quote,
             'userPublicKey': self.wallet_pubkey,
             'wrapAndUnwrapSol': True,
             'dynamicComputeUnitLimit': True,
-            'prioritizationFeeLamports': self.config.priority_fee_lamports
+            'prioritizationFeeLamports': priority_fee_lamports
         }
         if self.config.use_helius_sender:
             payload['asLegacyTransaction'] = True
@@ -1664,6 +1687,43 @@ class LiveTradingEngine:
         if not isinstance(signature, Signature):
             signature = Signature.from_bytes(signature)
         return VersionedTransaction.populate(message, [signature])
+    
+    def _get_priority_fee_lamports(self) -> int:
+        """Fetch dynamic priority fee or return configured fallback."""
+        if not self.config.enable_dynamic_priority_fees:
+            return self.config.priority_fee_lamports
+        if not self.rpc_url or not self.wallet_pubkey:
+            return self.config.priority_fee_lamports
+
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getPriorityFeeEstimate",
+            "params": [
+                {
+                    "accountKeys": [self.wallet_pubkey],
+                    "options": {"includeAllPriorityFeeLevels": True}
+                }
+            ],
+        }
+        try:
+            response = requests.post(self.rpc_url, json=payload, timeout=10)
+            response.raise_for_status()
+            result = response.json().get("result", {})
+            levels = result.get("priorityFeeLevels", {}) or {}
+            target_level = self.config.priority_fee_level or "high"
+            fee = levels.get(target_level)
+            if fee is None:
+                fee = result.get("priorityFeeEstimate")
+            if fee is None:
+                return self.config.priority_fee_lamports
+            fee_int = int(fee)
+            fee_int = max(self.config.min_priority_fee_lamports, fee_int)
+            fee_int = min(self.config.max_priority_fee_lamports, fee_int)
+            return fee_int
+        except Exception as exc:
+            logger.warning(f"Priority fee fetch failed: {exc}")
+            return self.config.priority_fee_lamports
     
     def _wait_for_confirmation(
         self,
