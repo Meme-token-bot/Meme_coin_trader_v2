@@ -991,8 +991,11 @@ class LiveTradingEngine:
                 return result
             
             # Execute via Jito or regular RPC
+            signed_payload = None
             if self.config.enable_jito_bundles and self.jito:
                 signature = self._execute_via_jito(swap_tx)
+            elif self.config.use_helius_sender:
+                signature, signed_payload = self._execute_via_helius_sender_with_payload(swap_tx)
             else:
                 signature = self._execute_via_rpc(swap_tx)
             
@@ -1002,7 +1005,7 @@ class LiveTradingEngine:
                 return result
             
             # Wait for confirmation
-            confirmed = self._wait_for_confirmation(signature)
+            confirmed = self._wait_for_confirmation(signature, signed_payload)
             
             if not confirmed:
                 result['error'] = "Transaction not confirmed"
@@ -1144,22 +1147,9 @@ class LiveTradingEngine:
                 return result
             
             # Execute
+            signed_payload = None
             if self.config.use_helius_sender:
-                try:
-                    tx_bytes = base64.b64decode(swap_tx)
-                    try:
-                        legacy_tx = Transaction.from_bytes(tx_bytes)
-                        legacy_tx = self._inject_helius_tip(legacy_tx)
-                    except Exception:
-                        versioned_tx = VersionedTransaction.from_bytes(tx_bytes)
-                        legacy_tx = self._build_legacy_from_versioned(versioned_tx)
-                    legacy_tx.sign([self.keypair], legacy_tx.message.recent_blockhash)
-                    signature = self._execute_via_helius_sender(
-                        base64.b64encode(bytes(legacy_tx)).decode("utf-8")
-                    )
-                except Exception as e:
-                    logger.error(f"Helius exit conversion failed: {e}")
-                    signature = None
+                signature, signed_payload = self._execute_via_helius_sender_with_payload(swap_tx)
             elif self.config.enable_jito_bundles and self.jito:
                 signature = self._execute_via_jito(swap_tx)
             else:
@@ -1170,15 +1160,15 @@ class LiveTradingEngine:
                 return result
             
             # Wait for confirmation
-            confirmed = self._wait_for_confirmation(signature)
+            confirmed = self._wait_for_confirmation(signature, signed_payload)
 
             if not confirmed and not self.config.use_helius_sender:
                 fallback_swap = self._prepare_legacy_swap(swap_tx)
                 if fallback_swap:
                     logger.warning("Exit not confirmed; retrying via Helius sender fallback.")
-                    fallback_sig = self._execute_via_helius_sender(fallback_swap)
+                    fallback_sig, fallback_payload = self._execute_via_helius_sender_with_payload(fallback_swap)
                     if fallback_sig:
-                        fallback_confirmed = self._wait_for_confirmation(fallback_sig)
+                        fallback_confirmed = self._wait_for_confirmation(fallback_sig, fallback_payload)
                         if fallback_confirmed:
                             signature = fallback_sig
                             confirmed = True
@@ -1509,8 +1499,24 @@ class LiveTradingEngine:
         
         return None
     
-    def _execute_via_helius_sender(self, swap_tx_base64: str) -> Optional[str]:
-        """Execute transaction via Helius sender (priority header)."""
+    def _prepare_helius_signed_tx(self, swap_tx_base64: str) -> Optional[str]:
+        """Prepare a signed legacy transaction for Helius sender submissions."""
+        try:
+            tx_bytes = base64.b64decode(swap_tx_base64)
+            try:
+                tx = Transaction.from_bytes(tx_bytes)
+            except Exception:
+                versioned_tx = VersionedTransaction.from_bytes(tx_bytes)
+                tx = self._build_legacy_from_versioned(versioned_tx)
+            tx = self._inject_helius_tip(tx)
+            tx.sign([self.keypair], tx.message.recent_blockhash)
+            return base64.b64encode(bytes(tx)).decode("utf-8")
+        except Exception as e:
+            logger.error(f"Helius sender signing error: {e}")
+            return None
+
+    def _send_helius_signed_tx(self, signed_tx_base64: str) -> Optional[str]:
+        """Send a signed legacy transaction via Helius sender."""
         sender_url = get_secret("HELIUS_SENDER_URL")
         if not sender_url:
             helius_key = get_secret("HELIUS_KEY")
@@ -1519,35 +1525,23 @@ class LiveTradingEngine:
         if not sender_url:
             logger.error("Helius sender unavailable: RPC URL not configured")
             return None
+        header_name = get_secret("HELIUS_PRIORITY_HEADER", "x-helius-priority")
+        header_value = get_secret("HELIUS_PRIORITY_VALUE", "true")
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "sendTransaction",
+            "params": [
+                signed_tx_base64,
+                {"encoding": "base64", "skipPreflight": True, "maxRetries": 0}
+            ]
+        }
+        headers = {
+            "Content-Type": "application/json",
+            header_name: header_value
+        }
+
         try:
-            tx_bytes = base64.b64decode(swap_tx_base64)
-            try:
-                tx = Transaction.from_bytes(tx_bytes)
-            except Exception as e:
-                logger.error(f"Helius sender requires legacy transactions: {e}")
-                return None
-
-            tx = self._inject_helius_tip(tx)
-            tx.sign([self.keypair], tx.message.recent_blockhash)
-            tx_base64 = base64.b64encode(bytes(tx)).decode("utf-8")
-
-            header_name = get_secret("HELIUS_PRIORITY_HEADER", "x-helius-priority")
-            header_value = get_secret("HELIUS_PRIORITY_VALUE", "true")
-
-            payload = {
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "sendTransaction",
-                "params": [
-                    tx_base64,
-                    {"encoding": "base64", "skipPreflight": True, "maxRetries": 0}
-                ]
-            }
-            headers = {
-                "Content-Type": "application/json",
-                header_name: header_value
-            }
-
             resp = requests.post(sender_url, json=payload, headers=headers, timeout=30)
             if resp.status_code != 200:
                 logger.error(f"Helius sender HTTP error: {resp.status_code} - {resp.text[:200]}")
@@ -1560,6 +1554,19 @@ class LiveTradingEngine:
             logger.error(f"Helius sender execution error: {e}")
 
         return None
+    
+    def _execute_via_helius_sender_with_payload(self, swap_tx_base64: str) -> Tuple[Optional[str], Optional[str]]:
+        """Execute via Helius sender and return signature plus signed payload."""
+        signed_tx_base64 = self._prepare_helius_signed_tx(swap_tx_base64)
+        if not signed_tx_base64:
+            return None, None
+        signature = self._send_helius_signed_tx(signed_tx_base64)
+        return signature, signed_tx_base64
+
+    def _execute_via_helius_sender(self, swap_tx_base64: str) -> Optional[str]:
+        """Execute transaction via Helius sender (priority header)."""
+        signature, _ = self._execute_via_helius_sender_with_payload(swap_tx_base64)
+        return signature
     
     def _execute_via_helius_sender_with_retries(self, swap_tx_base64: str) -> Optional[str]:
         """Retry Helius sender submissions to improve landing rate."""
@@ -1658,26 +1665,48 @@ class LiveTradingEngine:
             signature = Signature.from_bytes(signature)
         return VersionedTransaction.populate(message, [signature])
     
-    def _wait_for_confirmation(self, signature: str, timeout: int = None) -> bool:
-        """Wait for transaction confirmation"""
+    def _wait_for_confirmation(
+        self,
+        signature: str,
+        signed_tx_base64: Optional[str] = None,
+        timeout: int = None,
+        spam_interval: float = 0.3,
+        spam_duration: float = 12.0,
+        status_interval: float = 0.6,
+    ) -> bool:
+        """Wait for transaction confirmation with optional resend spamming."""
         timeout = timeout or self.config.confirmation_timeout
-        start = time.time()
-        
-        while time.time() - start < timeout:
-            try:
-                resp = self.solana_client.get_signature_statuses([Signature.from_string(signature)])
-                statuses = resp.value
-                
-                if statuses and statuses[0]:
-                    status = statuses[0]
-                    conf_status = str(status.confirmation_status)
-                    if 'confirmed' in conf_status.lower() or 'finalized' in conf_status.lower():
-                        return status.err is None
-                
-                time.sleep(1)
-            except Exception as e:
-                logger.warning(f"Confirmation check error: {e}")
-                time.sleep(2)
+        start = time.monotonic()
+        spam_until = start + max(spam_duration, 0) if signed_tx_base64 else start
+        next_spam = start
+        next_status = start
+
+        if not self.solana_client:
+            logger.warning("Confirmation check skipped: Solana client unavailable.")
+            return False
+
+        while time.monotonic() - start < timeout:
+            now = time.monotonic()
+
+            if signed_tx_base64 and now <= spam_until and now >= next_spam:
+                self._send_helius_signed_tx(signed_tx_base64)
+                next_spam = now + max(spam_interval, 0.05)
+
+            if now >= next_status:
+                try:
+                    resp = self.solana_client.get_signature_statuses([Signature.from_string(signature)])
+                    statuses = resp.value
+                    if statuses and statuses[0]:
+                        status = statuses[0]
+                        conf_status = str(status.confirmation_status)
+                        if 'confirmed' in conf_status.lower() or 'finalized' in conf_status.lower():
+                            return status.err is None
+                except Exception as e:
+                    logger.warning(f"Confirmation check error: {e}")
+
+                next_status = now + max(status_interval, 0.2)
+
+            time.sleep(0.05)
         
         return False
     
