@@ -35,8 +35,7 @@ import requests
 import logging
 import random
 
-from core.live_trading_fixes import LiveTradesTaxDB, IntegratedExitMonitor
-from core.token_swap_to_sol import TokenSwapper, SwapConfig
+from core.live_exit_manager import LiveExitManager, ExitConfig
 
 # Configure logging
 logging.basicConfig(
@@ -162,6 +161,9 @@ class LiveTradingConfig:
     exit_monitor_interval_seconds: int = 2   # Exit monitor check interval
     use_helius_sender_for_buys: bool = False # Route buys via Helius sender
     use_helius_sender_for_sells: bool = True # Route sells via Helius sender
+    enable_exit_websocket: bool = False      # Use Helius WS to trigger exits
+    exit_websocket_ping_seconds: int = 30    # WS ping interval
+    exit_websocket_reconnect_seconds: int = 5 # WS reconnect delay
     
     # Entry filters (from paper trading analysis)
     min_conviction: int = 60
@@ -744,6 +746,21 @@ class LiveTradingEngine:
                 self.config.exit_monitor_interval_seconds = int(exit_interval_override)
             except ValueError:
                 logger.warning(f"Invalid EXIT_MONITOR_INTERVAL_SECONDS: {exit_interval_override}")
+        exit_ws_override = get_secret('ENABLE_EXIT_WEBSOCKET')
+        if exit_ws_override:
+            self.config.enable_exit_websocket = exit_ws_override.lower() == 'true'
+        exit_ws_ping_override = get_secret('EXIT_WEBSOCKET_PING_SECONDS')
+        if exit_ws_ping_override:
+            try:
+                self.config.exit_websocket_ping_seconds = int(exit_ws_ping_override)
+            except ValueError:
+                logger.warning(f"Invalid EXIT_WEBSOCKET_PING_SECONDS: {exit_ws_ping_override}")
+        exit_ws_reconnect_override = get_secret('EXIT_WEBSOCKET_RECONNECT_SECONDS')
+        if exit_ws_reconnect_override:
+            try:
+                self.config.exit_websocket_reconnect_seconds = int(exit_ws_reconnect_override)
+            except ValueError:
+                logger.warning(f"Invalid EXIT_WEBSOCKET_RECONNECT_SECONDS: {exit_ws_reconnect_override}")
         retry_seconds_override = get_secret('HELIUS_SENDER_RETRY_SECONDS')
         if retry_seconds_override:
             try:
@@ -759,10 +776,24 @@ class LiveTradingEngine:
         if self.config.use_helius_sender and self.config.use_helius_sender_for_buys:
             self.config.enable_jito_bundles = False
         self.price_service = PriceService()
-        self.tax_db = LiveTradesTaxDB("live_trades_tax.db")
-        self.swapper = TokenSwapper(SwapConfig(slippage_bps=200))
-        self.exit_monitor = IntegratedExitMonitor(self.tax_db, self.swapper)
-        self.exit_monitor.start(check_interval=self.config.exit_monitor_interval_seconds)
+        self.tax_db = TaxDatabase("live_trades_tax.db")
+        self.helius_key = helius_key or get_secret('HELIUS_KEY')
+        exit_config = ExitConfig(
+            price_check_interval_seconds=self.config.exit_monitor_interval_seconds,
+            enable_auto_exits=True,
+        )
+        helius_ws_url = get_secret("HELIUS_WS_URL")
+        if not helius_ws_url and self.helius_key:
+            helius_ws_url = f"wss://mainnet.helius-rpc.com/?api-key={self.helius_key}"
+        self.exit_monitor = LiveExitManager(
+            self,
+            config=exit_config,
+            enable_websocket=self.config.enable_exit_websocket,
+            helius_ws_url=helius_ws_url,
+            websocket_ping_seconds=self.config.exit_websocket_ping_seconds,
+            websocket_reconnect_seconds=self.config.exit_websocket_reconnect_seconds,
+        )
+        self.exit_monitor.start_monitoring()
         
         # Load wallet
         self.keypair = None
@@ -796,7 +827,6 @@ class LiveTradingEngine:
                 logger.error(f"Failed to load wallet: {e}")
         
         # Solana client
-        self.helius_key = helius_key or get_secret('HELIUS_KEY')
         if self.helius_key:
             self.rpc_url = f"https://mainnet.helius-rpc.com/?api-key={self.helius_key}"
             self.solana_client = SolanaClient(self.rpc_url) if SOLANA_AVAILABLE else None
@@ -1028,7 +1058,6 @@ class LiveTradingEngine:
                 return result
             
             # Execute via Jito or regular RPC
-            signed_payload = None
             signed_payload = None
             use_helius_for_buy = self.config.use_helius_sender or self.config.use_helius_sender_for_buys
             if self.config.enable_jito_bundles and self.jito and not use_helius_for_buy:
@@ -1564,8 +1593,10 @@ class LiveTradingEngine:
         if not sender_url:
             logger.error("Helius sender unavailable: RPC URL not configured")
             return None
+        
         header_name = get_secret("HELIUS_PRIORITY_HEADER", "x-helius-priority")
         header_value = get_secret("HELIUS_PRIORITY_VALUE", "true")
+
         payload = {
             "jsonrpc": "2.0",
             "id": 1,

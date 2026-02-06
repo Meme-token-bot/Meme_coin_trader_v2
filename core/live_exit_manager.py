@@ -24,7 +24,10 @@ VERSION: 2.0.0
 import logging
 import threading
 import time
+import json
+import asyncio
 import requests
+import websockets
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
@@ -56,8 +59,13 @@ class ExitConfig:
     max_hold_hours: int = 12
     
     # Monitoring
-    price_check_interval_seconds: int = 30
+    price_check_interval_seconds: int = 2
     enable_auto_exits: bool = True
+
+     # Websocket monitoring
+    enable_websocket: bool = False
+    websocket_ping_seconds: int = 30
+    websocket_reconnect_seconds: int = 5
     
     # Safety
     min_liquidity_exit_usd: float = 5000.0
@@ -80,7 +88,11 @@ class LiveExitManager:
     def __init__(self, 
                  trading_engine,  # Existing LiveTradingEngine instance
                  config: ExitConfig = None,
-                 notifier = None):
+                 notifier = None,
+                 enable_websocket: bool = False,
+                 helius_ws_url: str = None,
+                 websocket_ping_seconds: int = None,
+                 websocket_reconnect_seconds: int = None):
         """
         Initialize exit manager.
         
@@ -92,6 +104,12 @@ class LiveExitManager:
         self.engine = trading_engine
         self.config = config or ExitConfig()
         self.notifier = notifier
+        self.config.enable_websocket = enable_websocket
+        if websocket_ping_seconds is not None:
+            self.config.websocket_ping_seconds = websocket_ping_seconds
+        if websocket_reconnect_seconds is not None:
+            self.config.websocket_reconnect_seconds = websocket_reconnect_seconds
+        self.helius_ws_url = helius_ws_url
         
         # Use engine's tax_db for position tracking
         self.tax_db = trading_engine.tax_db
@@ -99,6 +117,9 @@ class LiveExitManager:
         # Thread management
         self._monitor_running = False
         self._monitor_thread = None
+        self._ws_thread = None
+        self._ws_stop = threading.Event()
+        self._wake_event = threading.Event()
         self._lock = threading.RLock()
         
         # State tracking
@@ -396,12 +417,20 @@ class LiveExitManager:
         self._monitor_thread = threading.Thread(target=self._monitoring_loop, daemon=True)
         self._monitor_thread.start()
         logger.info("🔄 Exit monitoring started (checking every %ds)", self.config.price_check_interval_seconds)
+        if self.config.enable_websocket and self.helius_ws_url:
+            self._ws_stop.clear()
+            self._ws_thread = threading.Thread(target=self._run_websocket_loop, daemon=True)
+            self._ws_thread.start()
+            logger.info("📡 Exit websocket monitoring enabled")
     
     def stop_monitoring(self):
         """Stop the background monitoring"""
         self._monitor_running = False
+        self._ws_stop.set()
         if self._monitor_thread:
             self._monitor_thread.join(timeout=10)
+        if self._ws_thread:
+            self._ws_thread.join(timeout=10)
         logger.info("⏹️ Exit monitoring stopped")
     
     def _monitoring_loop(self):
@@ -419,8 +448,63 @@ class LiveExitManager:
                 if self._consecutive_failures >= 5:
                     logger.critical("Too many consecutive monitoring failures!")
             
-            # Wait for next check
-            time.sleep(self.config.price_check_interval_seconds)
+            # Wait for next check or websocket trigger
+            self._wake_event.wait(timeout=self.config.price_check_interval_seconds)
+            self._wake_event.clear()
+
+    def _run_websocket_loop(self):
+        try:
+            asyncio.run(self._websocket_loop())
+        except Exception as exc:
+            logger.warning(f"Exit websocket loop error: {exc}")
+
+    def _get_vault_addresses(self) -> List[str]:
+        positions = self.tax_db.get_positions()
+        vaults = []
+        for pos in positions:
+            for key in ("liquidity_pool_vault", "pool_vault_address", "vault_address"):
+                vault = pos.get(key)
+                if vault:
+                    vaults.append(vault)
+                    break
+        return list({v for v in vaults if v})
+
+    async def _websocket_loop(self):
+        while not self._ws_stop.is_set():
+            vaults = self._get_vault_addresses()
+            if not vaults:
+                logger.info("Exit websocket: no vault addresses found; sleeping.")
+                await asyncio.sleep(self.config.websocket_reconnect_seconds)
+                continue
+
+            try:
+                async with websockets.connect(self.helius_ws_url) as websocket:
+                    for idx, vault in enumerate(vaults, start=1):
+                        subscribe_msg = {
+                            "jsonrpc": "2.0",
+                            "id": idx,
+                            "method": "accountSubscribe",
+                            "params": [
+                                vault,
+                                {"encoding": "jsonParsed", "commitment": "confirmed"}
+                            ],
+                        }
+                        await websocket.send(json.dumps(subscribe_msg))
+
+                    while not self._ws_stop.is_set():
+                        try:
+                            message = await asyncio.wait_for(
+                                websocket.recv(),
+                                timeout=self.config.websocket_ping_seconds,
+                            )
+                            data = json.loads(message)
+                            if "params" in data:
+                                self._wake_event.set()
+                        except asyncio.TimeoutError:
+                            await websocket.ping()
+            except Exception as exc:
+                logger.warning(f"Exit websocket reconnecting after error: {exc}")
+                await asyncio.sleep(self.config.websocket_reconnect_seconds)
     
     def _check_all_positions(self):
         """Check all open positions for exit conditions"""
