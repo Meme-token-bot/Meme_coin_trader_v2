@@ -148,12 +148,14 @@ class LiveTradingConfig:
     # Execution
     default_slippage_bps: int = 300          # 3% slippage
     max_slippage_bps: int = 500              # 5% max
-    jito_tip_lamports: int = 1_000_000       # 0.001 SOL tip
+    jito_tip_lamports: int = 3_000_000       # 0.001 SOL tip
     priority_fee_lamports: int = 100_000     # Priority fee
     enable_dynamic_priority_fees: bool = True  # Fetch priority fees from RPC
-    priority_fee_level: str = "high"        # low/medium/high/veryHigh/unsafeMax
-    min_priority_fee_lamports: int = 10_000 # Floor when dynamic fees enabled
-    max_priority_fee_lamports: int = 2_000_000 # Ceiling when dynamic fees enabled
+    priority_fee_level: str = "veryHigh"    # low/medium/high/veryHigh/unsafeMax
+    min_priority_fee_lamports: int = 50_000 # Floor when dynamic fees enabled
+    max_priority_fee_lamports: int = 5_000_000 # Ceiling when dynamic fees enabled
+    dynamic_compute_unit_limit: bool = True # Let Jupiter size CU automatically
+    compute_unit_limit: Optional[int] = None # Explicit CU limit if set
     helius_sender_retry_seconds: int = 12    # Retry window for Helius sender
     helius_sender_retry_interval: float = 2  # Seconds between retries
     confirmation_timeout: int = 60           # Seconds
@@ -742,6 +744,12 @@ class LiveTradingEngine:
                 self.config.default_slippage_bps = int(slippage_override)
             except ValueError:
                 logger.warning(f"Invalid DEFAULT_SLIPPAGE_BPS: {slippage_override}")
+        jito_tip_override = get_secret('JITO_TIP_LAMPORTS')
+        if jito_tip_override:
+            try:
+                self.config.jito_tip_lamports = int(jito_tip_override)
+            except ValueError:
+                logger.warning(f"Invalid JITO_TIP_LAMPORTS: {jito_tip_override}")
         priority_override = get_secret('PRIORITY_FEE_LAMPORTS')
         if priority_override:
             try:
@@ -766,6 +774,15 @@ class LiveTradingEngine:
                 self.config.max_priority_fee_lamports = int(max_fee_override)
             except ValueError:
                 logger.warning(f"Invalid MAX_PRIORITY_FEE_LAMPORTS: {max_fee_override}")
+        dynamic_cu_override = get_secret('DYNAMIC_COMPUTE_UNIT_LIMIT')
+        if dynamic_cu_override:
+            self.config.dynamic_compute_unit_limit = dynamic_cu_override.lower() == 'true'
+        compute_unit_override = get_secret('COMPUTE_UNIT_LIMIT')
+        if compute_unit_override:
+            try:
+                self.config.compute_unit_limit = int(compute_unit_override)
+            except ValueError:
+                logger.warning(f"Invalid COMPUTE_UNIT_LIMIT: {compute_unit_override}")
         exit_interval_override = get_secret('EXIT_MONITOR_INTERVAL_SECONDS')
         if exit_interval_override:
             try:
@@ -1445,9 +1462,11 @@ class LiveTradingEngine:
             'quoteResponse': quote,
             'userPublicKey': self.wallet_pubkey,
             'wrapAndUnwrapSol': True,
-            'dynamicComputeUnitLimit': True,
+            'dynamicComputeUnitLimit': self.config.dynamic_compute_unit_limit,
             'prioritizationFeeLamports': priority_fee_lamports
         }
+        if self.config.compute_unit_limit:
+            payload['computeUnitLimit'] = self.config.compute_unit_limit
         if self.config.use_helius_sender:
             payload['asLegacyTransaction'] = True
             payload['useSharedAccounts'] = False
