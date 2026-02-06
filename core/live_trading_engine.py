@@ -161,7 +161,7 @@ class LiveTradingConfig:
     confirmation_timeout: int = 60           # Seconds
     retry_attempts: int = 2
     exit_monitor_interval_seconds: int = 2   # Exit monitor check interval
-    use_helius_sender_for_buys: bool = False # Route buys via Helius sender
+    use_helius_sender_for_buys: bool = True # Route buys via Helius sender
     use_helius_sender_for_sells: bool = True # Route sells via Helius sender
     enable_exit_websocket: bool = False      # Use Helius WS to trigger exits
     exit_websocket_ping_seconds: int = 30    # WS ping interval
@@ -182,7 +182,7 @@ class LiveTradingConfig:
     enable_live_trading: bool = False        # MUST be True to trade
     enable_jito_bundles: bool = True         # Use Jito for speed
     parallel_paper_trading: bool = True      # Run paper alongside
-    use_helius_sender: bool = False           # Use Helius RPC sender instead of Jito
+    use_helius_sender: bool = True           # Use Helius RPC sender instead of Jito
     
     # Tax (NZ)
     tax_year_start_month: int = 4            # April
@@ -1100,9 +1100,10 @@ class LiveTradingEngine:
                 self.tax_db.log_execution('BUY', token_address, token_symbol, 'FAILED', error=result['error'])
                 return result
             
-            # Execute: fresh blockhash + sign + send via standard RPC (no tip needed)
+            # Execute via configured transport (Helius sender or standard RPC).
             signed_payload = None
-            signature, signed_payload = self._execute_direct_rpc(swap_tx)
+            use_sender = self.config.use_helius_sender and self.config.use_helius_sender_for_buys
+            signature, signed_payload = self._execute_swap_transport(swap_tx, use_sender=use_sender)
             
             if not signature:
                 result['error'] = "Transaction failed"
@@ -1255,9 +1256,10 @@ class LiveTradingEngine:
                 result['error'] = "Failed to get swap transaction"
                 return result
             
-            # Execute
+            # Execute via configured transport (Helius sender or standard RPC).
             signed_payload = None
-            signature, signed_payload = self._execute_direct_rpc(swap_tx)
+            use_sender = self.config.use_helius_sender and self.config.use_helius_sender_for_sells
+            signature, signed_payload = self._execute_swap_transport(swap_tx, use_sender=use_sender)
             
             if not signature:
                 result['error'] = "Transaction failed"
@@ -1278,7 +1280,10 @@ class LiveTradingEngine:
                 if retry_quote:
                     retry_swap = self._get_jupiter_swap(retry_quote)
                     if retry_swap:
-                        retry_sig, retry_payload = self._execute_direct_rpc(retry_swap)
+                        retry_sig, retry_payload = self._execute_swap_transport(
+                            retry_swap,
+                            use_sender=(self.config.use_helius_sender and self.config.use_helius_sender_for_sells),
+                        )
                         if retry_sig:
                             retry_confirmed = self._wait_for_confirmation(retry_sig, retry_payload)
                             if retry_confirmed:
@@ -1463,8 +1468,9 @@ class LiveTradingEngine:
             'dynamicComputeUnitLimit': True,
             'prioritizationFeeLamports': priority_fee_lamports,
             'dynamicSlippage': {"maxBps": 1500},
-            'asLegacyTransaction': True,
-            'useSharedAccounts': False,
+            # Keep Jupiter defaults to avoid token-program/account incompatibilities
+            # on newer pools (e.g., token-2022/shared account routes).
+            'asLegacyTransaction': False,
         }
         if self.config.compute_unit_limit:
             payload['computeUnitLimit'] = self.config.compute_unit_limit
@@ -1614,6 +1620,60 @@ class LiveTradingEngine:
         
         return None
     
+    def _sign_swap_transaction_base64(self, swap_tx_base64: str) -> Optional[str]:
+        """Sign Jupiter-provided swap tx (legacy or v0) without mutating instructions."""
+        try:
+            tx_bytes = base64.b64decode(swap_tx_base64)
+            try:
+                tx = VersionedTransaction.from_bytes(tx_bytes)
+                tx = self._sign_versioned_transaction(tx)
+                return base64.b64encode(bytes(tx)).decode("utf-8")
+            except Exception:
+                tx = Transaction.from_bytes(tx_bytes)
+                tx.sign([self.keypair], tx.message.recent_blockhash)
+                return base64.b64encode(bytes(tx)).decode("utf-8")
+        except Exception as e:
+            logger.error(f"Swap signing error: {e}")
+            return None
+
+    def _send_signed_tx_via_rpc(self, signed_tx_base64: str) -> Optional[str]:
+        """Send an already-signed tx via standard RPC sendTransaction."""
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "sendTransaction",
+            "params": [
+                signed_tx_base64,
+                {"encoding": "base64", "skipPreflight": True, "maxRetries": 5},
+            ],
+        }
+        try:
+            resp = requests.post(self.rpc_url, json=payload, timeout=30)
+            if resp.status_code != 200:
+                logger.error(f"RPC send HTTP error: {resp.status_code} - {resp.text[:200]}")
+                return None
+            result = resp.json()
+            if "result" in result:
+                return str(result["result"])
+            logger.error(f"RPC send error: {result.get('error')}")
+            return None
+        except Exception as e:
+            logger.error(f"RPC send execution error: {e}")
+            return None
+
+    def _execute_swap_transport(self, swap_tx_base64: str, use_sender: bool) -> Tuple[Optional[str], Optional[str]]:
+        """Sign Jupiter tx and submit via Helius sender or standard RPC."""
+        signed_tx_base64 = self._sign_swap_transaction_base64(swap_tx_base64)
+        if not signed_tx_base64:
+            return None, None
+
+        signature = self._send_helius_signed_tx(signed_tx_base64) if use_sender else self._send_signed_tx_via_rpc(signed_tx_base64)
+        if signature:
+            via = "Helius sender" if use_sender else "standard RPC"
+            logger.info(f"📤 {via} accepted: {signature[:32]}...")
+            return signature, signed_tx_base64
+        return None, None
+    
     def _execute_direct_rpc(self, swap_tx_base64: str) -> Tuple[Optional[str], Optional[str]]:
         """Execute a swap via standard Helius RPC with fresh blockhash.
         
@@ -1739,7 +1799,7 @@ class LiveTradingEngine:
     
     def _execute_via_helius_sender_with_payload(self, swap_tx_base64: str) -> Tuple[Optional[str], Optional[str]]:
         """Execute via Helius sender and return signature plus signed payload."""
-        signed_tx_base64 = self._prepare_helius_signed_tx(swap_tx_base64)
+        signed_tx_base64 = self._sign_swap_transaction_base64(swap_tx_base64)
         if not signed_tx_base64:
             return None, None
         signature = self._send_helius_signed_tx(signed_tx_base64)
