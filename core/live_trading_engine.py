@@ -151,7 +151,7 @@ class LiveTradingConfig:
     max_slippage_bps: int = 500              # 5% max
     jito_tip_lamports: int = 1_000_000       # 0.001 SOL tip
     priority_fee_lamports: int = 100_000     # Priority fee
-    enable_dynamic_priority_fees: bool = False  # Fetch priority fees from RPC
+    enable_dynamic_priority_fees: bool = True  # Fetch priority fees from RPC
     priority_fee_level: str = "high"        # low/medium/high/veryHigh/unsafeMax
     min_priority_fee_lamports: int = 10_000 # Floor when dynamic fees enabled
     max_priority_fee_lamports: int = 2_000_000 # Ceiling when dynamic fees enabled
@@ -159,6 +159,9 @@ class LiveTradingConfig:
     helius_sender_retry_interval: float = 2  # Seconds between retries
     confirmation_timeout: int = 60           # Seconds
     retry_attempts: int = 2
+    exit_monitor_interval_seconds: int = 2   # Exit monitor check interval
+    use_helius_sender_for_buys: bool = False # Route buys via Helius sender
+    use_helius_sender_for_sells: bool = True # Route sells via Helius sender
     
     # Entry filters (from paper trading analysis)
     min_conviction: int = 60
@@ -699,6 +702,12 @@ class LiveTradingEngine:
             self.config.enable_live_trading = get_secret('ENABLE_LIVE_TRADING', '').lower() == 'true'
         if not self.config.use_helius_sender:
             self.config.use_helius_sender = get_secret('USE_HELIUS_SENDER', '').lower() == 'true'
+        sender_buys_override = get_secret('USE_HELIUS_SENDER_FOR_BUYS')
+        if sender_buys_override:
+            self.config.use_helius_sender_for_buys = sender_buys_override.lower() == 'true'
+        sender_sells_override = get_secret('USE_HELIUS_SENDER_FOR_SELLS')
+        if sender_sells_override:
+            self.config.use_helius_sender_for_sells = sender_sells_override.lower() == 'true'
         slippage_override = get_secret('DEFAULT_SLIPPAGE_BPS')
         if slippage_override:
             try:
@@ -729,6 +738,12 @@ class LiveTradingEngine:
                 self.config.max_priority_fee_lamports = int(max_fee_override)
             except ValueError:
                 logger.warning(f"Invalid MAX_PRIORITY_FEE_LAMPORTS: {max_fee_override}")
+        exit_interval_override = get_secret('EXIT_MONITOR_INTERVAL_SECONDS')
+        if exit_interval_override:
+            try:
+                self.config.exit_monitor_interval_seconds = int(exit_interval_override)
+            except ValueError:
+                logger.warning(f"Invalid EXIT_MONITOR_INTERVAL_SECONDS: {exit_interval_override}")
         retry_seconds_override = get_secret('HELIUS_SENDER_RETRY_SECONDS')
         if retry_seconds_override:
             try:
@@ -741,13 +756,13 @@ class LiveTradingEngine:
                 self.config.helius_sender_retry_interval = float(retry_interval_override)
             except ValueError:
                 logger.warning(f"Invalid HELIUS_SENDER_RETRY_INTERVAL: {retry_interval_override}")
-        if self.config.use_helius_sender:
+        if self.config.use_helius_sender and self.config.use_helius_sender_for_buys:
             self.config.enable_jito_bundles = False
         self.price_service = PriceService()
         self.tax_db = LiveTradesTaxDB("live_trades_tax.db")
         self.swapper = TokenSwapper(SwapConfig(slippage_bps=200))
         self.exit_monitor = IntegratedExitMonitor(self.tax_db, self.swapper)
-        self.exit_monitor.start(check_interval=30)
+        self.exit_monitor.start(check_interval=self.config.exit_monitor_interval_seconds)
         
         # Load wallet
         self.keypair = None
@@ -1014,12 +1029,12 @@ class LiveTradingEngine:
             
             # Execute via Jito or regular RPC
             signed_payload = None
-            if self.config.enable_jito_bundles and self.jito:
-                signature = self._execute_via_jito(swap_tx)
-            elif self.config.use_helius_sender:
-                signature, signed_payload = self._execute_via_helius_sender_with_payload(swap_tx)
-            else:
+            signed_payload = None
+            use_helius_for_buy = self.config.use_helius_sender or self.config.use_helius_sender_for_buys
+            if self.config.enable_jito_bundles and self.jito and not use_helius_for_buy:
                 signature = self._execute_via_rpc(swap_tx)
+            elif use_helius_for_buy:
+                signature, signed_payload = self._execute_via_helius_sender_with_payload(swap_tx)
             
             if not signature:
                 result['error'] = "Transaction failed"
@@ -1170,7 +1185,8 @@ class LiveTradingEngine:
             
             # Execute
             signed_payload = None
-            if self.config.use_helius_sender:
+            use_helius_for_sell = self.config.use_helius_sender or self.config.use_helius_sender_for_sells
+            if use_helius_for_sell:
                 signature, signed_payload = self._execute_via_helius_sender_with_payload(swap_tx)
             elif self.config.enable_jito_bundles and self.jito:
                 signature = self._execute_via_jito(swap_tx)
@@ -1184,7 +1200,7 @@ class LiveTradingEngine:
             # Wait for confirmation
             confirmed = self._wait_for_confirmation(signature, signed_payload)
 
-            if not confirmed and not self.config.use_helius_sender:
+            if not confirmed and not use_helius_for_sell:
                 fallback_swap = self._prepare_legacy_swap(swap_tx)
                 if fallback_swap:
                     logger.warning("Exit not confirmed; retrying via Helius sender fallback.")
