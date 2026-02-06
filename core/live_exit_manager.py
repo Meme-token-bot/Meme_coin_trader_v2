@@ -120,6 +120,7 @@ class LiveExitManager:
         self._ws_thread = None
         self._ws_stop = threading.Event()
         self._wake_event = threading.Event()
+        self._vault_refresh = threading.Event()
         self._lock = threading.RLock()
         
         # State tracking
@@ -458,6 +459,11 @@ class LiveExitManager:
         except Exception as exc:
             logger.warning(f"Exit websocket loop error: {exc}")
 
+    def refresh_websocket_subscriptions(self):
+        """Trigger websocket subscription refresh and wake exit checks."""
+        self._vault_refresh.set()
+        self._wake_event.set()
+
     def _get_vault_addresses(self) -> List[str]:
         positions = self.tax_db.get_positions()
         vaults = []
@@ -500,11 +506,15 @@ class LiveExitManager:
                             data = json.loads(message)
                             if "params" in data:
                                 self._wake_event.set()
+                            if self._vault_refresh.is_set():
+                                self._vault_refresh.clear()
+                                break
                         except asyncio.TimeoutError:
                             await websocket.ping()
             except Exception as exc:
                 logger.warning(f"Exit websocket reconnecting after error: {exc}")
                 await asyncio.sleep(self.config.websocket_reconnect_seconds)
+
     
     def _check_all_positions(self):
         """Check all open positions for exit conditions"""

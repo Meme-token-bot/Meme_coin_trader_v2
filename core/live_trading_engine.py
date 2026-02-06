@@ -262,6 +262,25 @@ class PriceService:
         
         return None
 
+    def get_main_pool_vault(self, token_address: str) -> Optional[str]:
+        """Fetch the most liquid pool vault address for a token."""
+        try:
+            resp = requests.get(DEXSCREENER_URL.format(token_address), timeout=10)
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+            pairs = data.get('pairs', [])
+            if not pairs:
+                return None
+            best_pair = max(
+                pairs,
+                key=lambda p: float(p.get('liquidity', {}).get('usd', 0) or 0)
+            )
+            return best_pair.get('pairAddress')
+        except Exception as exc:
+            logger.warning(f"DexScreener vault lookup failed for {token_address}: {exc}")
+            return None
+
 
 # =============================================================================
 # JITO BUNDLE SERVICE
@@ -455,10 +474,16 @@ class TaxDatabase:
                     take_profit_pct REAL,
                     trailing_stop_pct REAL,
                     peak_price_usd REAL,
+                    liquidity_pool_vault TEXT,
                     entry_signature TEXT,
                     conviction_score INTEGER
                 )
             """)
+            columns = {
+                row[1] for row in conn.execute("PRAGMA table_info(live_positions)").fetchall()
+            }
+            if "liquidity_pool_vault" not in columns:
+                conn.execute("ALTER TABLE live_positions ADD COLUMN liquidity_pool_vault TEXT")
             
             # Daily stats
             conn.execute("""
@@ -550,8 +575,8 @@ class TaxDatabase:
                     token_address, token_symbol, tokens_held, entry_price_usd,
                     entry_time, total_cost_sol, total_cost_nzd, stop_loss_pct,
                     take_profit_pct, trailing_stop_pct, peak_price_usd,
-                    entry_signature, conviction_score
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    liquidity_pool_vault, entry_signature, conviction_score
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 position['token_address'],
                 position.get('token_symbol', 'UNKNOWN'),
@@ -564,6 +589,7 @@ class TaxDatabase:
                 position.get('take_profit_pct', 0.30),
                 position.get('trailing_stop_pct', 0.10),
                 position.get('peak_price_usd', position.get('entry_price_usd', 0)),
+                position.get('liquidity_pool_vault'),
                 position.get('entry_signature', ''),
                 position.get('conviction_score', 0)
             ))
@@ -1113,6 +1139,7 @@ class LiveTradingEngine:
             self.tax_db.record_trade(trade_data)
             
             # Add position
+            liquidity_pool_vault = self.price_service.get_main_pool_vault(token_address)
             position_data = {
                 'token_address': token_address,
                 'token_symbol': token_symbol,
@@ -1124,6 +1151,7 @@ class LiveTradingEngine:
                 'total_cost_usd': total_value_usd,
                 'total_cost_nzd': total_value_nzd,
                 'entry_signature': signature,
+                'liquidity_pool_vault': liquidity_pool_vault,
                 'conviction_score': signal.get('conviction_score', 0),
                 'stop_loss_pct': signal.get('stop_loss_pct', self.config.stop_loss_pct),
                 'take_profit_pct': signal.get('take_profit_pct', self.config.take_profit_pct),
@@ -1131,6 +1159,8 @@ class LiveTradingEngine:
                 'peak_price_usd': token_price,
             }
             self.tax_db.add_position(position_data)
+            if liquidity_pool_vault and self.exit_monitor:
+                self.exit_monitor.refresh_websocket_subscriptions()
             
             # Log success
             self.tax_db.log_execution('BUY', token_address, token_symbol, 'SUCCESS', 
