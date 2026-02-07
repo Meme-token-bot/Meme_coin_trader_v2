@@ -34,6 +34,7 @@ from solders.transaction import VersionedTransaction            # type: ignore
 from solders.message import MessageV0, MessageHeader            # type: ignore
 from solders.instruction import CompiledInstruction             # type: ignore
 from solders.system_program import ID as SYS_PROGRAM_ID         # type: ignore
+from solders.null_signer import NullSigner 
 
 # ─── Logging ────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -294,8 +295,10 @@ def _inject_jito_tip(
         lookups,
     )
 
-    # Return as raw bytes — caller will sign
-    unsigned_tx = VersionedTransaction(new_msg, [])
+    # Return as raw bytes with placeholder signatures.
+    # VersionedTransaction requires one signer object for each required
+    # signature slot, otherwise solders raises "not enough signers".
+    unsigned_tx = VersionedTransaction(new_msg, [NullSigner(payer_pubkey)])
     return bytes(unsigned_tx)
 
 
