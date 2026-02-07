@@ -25,6 +25,8 @@ Usage in master_v2.py:
 Author: Trading Bot System
 """
 
+from __future__ import annotations
+
 import os
 import json
 import time
