@@ -36,6 +36,7 @@ import logging
 import random
 
 from core.live_exit_manager import LiveExitManager, ExitConfig
+from core.sol_swapper_bridge import SolSwapperBridge
 
 # Configure logging
 logging.basicConfig(
@@ -163,6 +164,7 @@ class LiveTradingConfig:
     exit_monitor_interval_seconds: int = 2   # Exit monitor check interval
     use_helius_sender_for_buys: bool = True # Route buys via Helius sender
     use_helius_sender_for_sells: bool = True # Route sells via Helius sender
+    use_sol_swapper_execution: bool = True   # Reuse proven sol-swapper Sender flow
     enable_exit_websocket: bool = False      # Use Helius WS to trigger exits
     exit_websocket_ping_seconds: int = 30    # WS ping interval
     exit_websocket_reconnect_seconds: int = 5 # WS reconnect delay
@@ -824,6 +826,9 @@ class LiveTradingEngine:
                 logger.warning(f"Invalid HELIUS_SENDER_TIP_LAMPORTS: {sender_tip_override}")
         if self.config.use_helius_sender and self.config.use_helius_sender_for_buys:
             self.config.enable_jito_bundles = False
+        sol_swapper_override = get_secret('USE_SOL_SWAPPER_EXECUTION')
+        if sol_swapper_override:
+            self.config.use_sol_swapper_execution = sol_swapper_override.lower() == 'true'
         self.price_service = PriceService()
         self.tax_db = TaxDatabase("live_trades_tax.db")
         self._last_sender_tip_error = False
@@ -886,6 +891,13 @@ class LiveTradingEngine:
         
         # Jito service
         self.jito = JitoBundleService(self.keypair) if self.keypair else None
+        self.sol_swapper_bridge = None
+        if self.config.use_sol_swapper_execution and self.config.use_helius_sender:
+            try:
+                self.sol_swapper_bridge = SolSwapperBridge()
+                logger.info("   Sol-swapper execution bridge: ENABLED")
+            except Exception as e:
+                logger.warning(f"⚠️ Sol-swapper bridge unavailable, using native execution: {e}")
         
         # State tracking
         self._consecutive_losses = 0
@@ -1086,49 +1098,74 @@ class LiveTradingEngine:
         input_lamports = int(sol_amount * LAMPORTS_PER_SOL)
         
         try:
-            # Get Jupiter quote
-            quote = self._get_jupiter_quote(
-                input_mint=SOL_MINT,
-                output_mint=token_address,
-                amount=input_lamports,
-                slippage_bps=self.config.default_slippage_bps
-            )
-            
-            if not quote:
-                result['error'] = "Failed to get quote"
-                self.tax_db.log_execution('BUY', token_address, token_symbol, 'FAILED', error=result['error'])
-                return result
-            
-            # Get swap transaction
             use_sender = self.config.use_helius_sender and self.config.use_helius_sender_for_buys
-            swap_tx = self._get_jupiter_swap(quote, as_legacy=use_sender)
+            if use_sender and self.sol_swapper_bridge:
+                bridge_result = self.sol_swapper_bridge.buy(
+                    token_mint=token_address,
+                    sol_amount=sol_amount,
+                    slippage_bps=self.config.default_slippage_bps,
+                    priority_fee=self.config.priority_fee_lamports,
+                    jito_tip=self.config.jito_tip_lamports,
+                )
+                signature = bridge_result.get('signature')
+                if not bridge_result.get('success') or not signature:
+                    result['error'] = bridge_result.get('error') or 'Sol-swapper execution failed'
+                    self.tax_db.log_execution('BUY', token_address, token_symbol, 'FAILED', error=result['error'])
+                    return result
+                out_amount = int(bridge_result.get('output_amount') or 0)
+                if out_amount <= 0:
+                    fallback_quote = self._get_jupiter_quote(
+                        input_mint=SOL_MINT,
+                        output_mint=token_address,
+                        amount=input_lamports,
+                        slippage_bps=self.config.default_slippage_bps
+                    )
+                    out_amount = int((fallback_quote or {}).get('outAmount', 0) or 0)
+                decimals = self._get_token_decimals(token_address)
+                tokens_received = out_amount / (10 ** decimals) if out_amount > 0 else 0
+            else:
+                # Get Jupiter quote
+                quote = self._get_jupiter_quote(
+                    input_mint=SOL_MINT,
+                    output_mint=token_address,
+                    amount=input_lamports,
+                    slippage_bps=self.config.default_slippage_bps
+                )
             
-            if not swap_tx:
-                result['error'] = "Failed to get swap transaction"
-                self.tax_db.log_execution('BUY', token_address, token_symbol, 'FAILED', error=result['error'])
-                return result
+                if not quote:
+                    result['error'] = "Failed to get quote"
+                    self.tax_db.log_execution('BUY', token_address, token_symbol, 'FAILED', error=result['error'])
+                    return result
             
-            # Execute via configured transport (Helius sender or standard RPC).
-            signed_payload = None
-            signature, signed_payload = self._execute_swap_transport(swap_tx, use_sender=use_sender)
+                # Get swap transaction
+                swap_tx = self._get_jupiter_swap(quote, as_legacy=use_sender)
             
-            if not signature:
-                result['error'] = "Transaction failed"
-                self.tax_db.log_execution('BUY', token_address, token_symbol, 'FAILED', error=result['error'])
-                return result
+                if not swap_tx:
+                    result['error'] = "Failed to get swap transaction"
+                    self.tax_db.log_execution('BUY', token_address, token_symbol, 'FAILED', error=result['error'])
+                    return result
             
-            # Wait for confirmation
-            confirmed = self._wait_for_confirmation(signature, signed_payload)
+                # Execute via configured transport (Helius sender or standard RPC).
+                signed_payload = None
+                signature, signed_payload = self._execute_swap_transport(swap_tx, use_sender=use_sender)
             
-            if not confirmed:
-                result['error'] = "Transaction not confirmed"
-                self.tax_db.log_execution('BUY', token_address, token_symbol, 'UNCONFIRMED', 
-                                          signature=signature, error=result['error'])
-                return result
-            
-            # Calculate received tokens
-            out_amount = int(quote.get('outAmount', 0))
-            tokens_received = out_amount / (10 ** 6)  # Assume 6 decimals, adjust as needed
+                if not signature:
+                    result['error'] = "Transaction failed"
+                    self.tax_db.log_execution('BUY', token_address, token_symbol, 'FAILED', error=result['error'])
+                    return result
+                
+                # Wait for confirmation
+                confirmed = self._wait_for_confirmation(signature, signed_payload)
+                
+                if not confirmed:
+                    result['error'] = "Transaction not confirmed"
+                    self.tax_db.log_execution('BUY', token_address, token_symbol, 'UNCONFIRMED', 
+                                            signature=signature, error=result['error'])
+                    return result
+                
+                # Calculate received tokens
+                out_amount = int(quote.get('outAmount', 0))
+                tokens_received = out_amount / (10 ** 6)  # Assume 6 decimals, adjust as needed
             
             # Calculate values
             token_price_nzd = token_price * (sol_nzd / sol_usd) if sol_usd > 0 else 0
@@ -1244,37 +1281,52 @@ class LiveTradingEngine:
                 result['error'] = "Token amount is too small to swap"
                 return result
             
-            # Get Jupiter quote (sell token for SOL)
-            quote = self._get_jupiter_quote(
-                input_mint=token_address,
-                output_mint=SOL_MINT,
-                amount=token_amount,
-                slippage_bps=self.config.default_slippage_bps
-            )
-            
-            if not quote:
-                result['error'] = "Failed to get quote"
-                return result
-            
-            # Get swap transaction
             use_sender = self.config.use_helius_sender and self.config.use_helius_sender_for_sells
-            swap_tx = self._get_jupiter_swap(quote, as_legacy=use_sender)
-            
-            if not swap_tx:
-                result['error'] = "Failed to get swap transaction"
-                return result
-            
-            # Execute via configured transport (Helius sender or standard RPC).
-            signed_payload = None
-            signature, signed_payload = self._execute_swap_transport(swap_tx, use_sender=use_sender)
-            
-            if not signature:
-                result['error'] = "Transaction failed"
-                return result
-            
-            # Wait for confirmation
-            confirmed = self._wait_for_confirmation(signature, signed_payload)
-
+            if use_sender and self.sol_swapper_bridge:
+                bridge_result = self.sol_swapper_bridge.sell(
+                    token_mint=token_address,
+                    token_amount_raw=token_amount,
+                    slippage_bps=self.config.default_slippage_bps,
+                    priority_fee=self.config.priority_fee_lamports,
+                    jito_tip=self.config.jito_tip_lamports,
+                )
+                signature = bridge_result.get('signature')
+                confirmed = bool(bridge_result.get('success') and signature)
+                quote = {'outAmount': int(bridge_result.get('output_amount') or 0)}
+                if not confirmed:
+                    result['error'] = bridge_result.get('error') or 'Sol-swapper execution failed'
+                    return result
+            else:
+                # Get Jupiter quote (sell token for SOL)
+                quote = self._get_jupiter_quote(
+                    input_mint=token_address,
+                    output_mint=SOL_MINT,
+                    amount=token_amount,
+                    slippage_bps=self.config.default_slippage_bps
+                )
+                
+                if not quote:
+                    result['error'] = "Failed to get quote"
+                    return result
+                
+                # Get swap transaction
+                swap_tx = self._get_jupiter_swap(quote, as_legacy=use_sender)
+                
+                if not swap_tx:
+                    result['error'] = "Failed to get swap transaction"
+                    return result
+                
+                # Execute via configured transport (Helius sender or standard RPC).
+                signed_payload = None
+                signature, signed_payload = self._execute_swap_transport(swap_tx, use_sender=use_sender)
+                
+                if not signature:
+                    result['error'] = "Transaction failed"
+                    return result
+                
+                # Wait for confirmation
+                confirmed = self._wait_for_confirmation(signature, signed_payload)
+                
             if not confirmed:
                 # Retry: get a new quote and try again
                 logger.warning("Exit not confirmed; retrying with fresh quote...")
