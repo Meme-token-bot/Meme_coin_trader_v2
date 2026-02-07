@@ -46,8 +46,8 @@ SECRETS_CONFIG = {
     # 'wallet': 'prod/solana-bot/hot-wallet', # DEPRECATED - now in 'keys'
 }
 
-# AWS Region (us-west-2 based on your ARN)
-AWS_REGION = os.getenv('AWS_REGION', 'us-west-2')
+# AWS Region (eu-west-1 based on your ARN)
+AWS_REGION = os.getenv('AWS_REGION', 'eu-west-1')
 
 # Set to True to use AWS Secrets Manager, False for .env fallback
 USE_AWS_SECRETS = os.getenv('USE_AWS_SECRETS', 'true').lower() == 'true'
