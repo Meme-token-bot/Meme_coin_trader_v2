@@ -1,0 +1,27 @@
+[Unit]
+Description=SOL Token Swapper (Helius SWQOS)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ec2-user
+WorkingDirectory=/home/ec2-user/sol-swapper
+ExecStart=/home/ec2-user/sol-swapper/.venv/bin/python main.py buy <TOKEN_MINT> 0.1
+# Adjust ExecStart to your actual command, or wrap in a loop-runner for
+# continuous operation.
+
+# Restart policy (useful if converted to Type=simple with a loop runner)
+# Restart=on-failure
+# RestartSec=5
+
+# Environment
+Environment=PYTHONUNBUFFERED=1
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/home/ec2-user/sol-swapper
+
+[Install]
+WantedBy=multi-user.target
