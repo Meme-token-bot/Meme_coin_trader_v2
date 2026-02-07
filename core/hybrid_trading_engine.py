@@ -591,6 +591,30 @@ class HybridTradingEngine:
 # INTEGRATION FUNCTIONS
 # =============================================================================
 
+def _parse_blocked_hours_env(value: str):
+    """Parse BLOCKED_HOURS_UTC env value (CSV, empty string disables)."""
+    if value is None:
+        return None
+
+    cleaned = value.strip()
+    if cleaned == '':
+        logger.info("✅ BLOCKED_HOURS_UTC empty; blocked hours disabled")
+        return []
+
+    try:
+        parsed = [int(h.strip()) for h in cleaned.split(',') if h.strip()]
+    except ValueError:
+        logger.warning(f"⚠️ Invalid BLOCKED_HOURS_UTC format: {value!r} (expected CSV of 0-23)")
+        return None
+
+    invalid = [h for h in parsed if h < 0 or h > 23]
+    if invalid:
+        logger.warning(f"⚠️ Invalid blocked hours ignored (must be 0-23): {invalid}")
+        return None
+
+    logger.info(f"✅ Blocked hours set from BLOCKED_HOURS_UTC: {parsed}")
+    return parsed
+
 def create_hybrid_engine(paper_engine, notifier=None) -> HybridTradingEngine:
     """
     Create a hybrid trading engine with live trading support.
@@ -620,6 +644,10 @@ def create_hybrid_engine(paper_engine, notifier=None) -> HybridTradingEngine:
         max_daily_loss_sol=float(get_secret('MAX_DAILY_LOSS_SOL', '0.25')),
         min_conviction=int(get_secret('MIN_CONVICTION', '60')),
     )
+
+    blocked_hours_override = _parse_blocked_hours_env(get_secret('BLOCKED_HOURS_UTC'))
+    if blocked_hours_override is not None:
+        config.blocked_hours_utc = blocked_hours_override
     
     # Create live engine if enabled
     live_engine = None

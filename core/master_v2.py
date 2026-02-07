@@ -220,6 +220,24 @@ def _update_config_from_secrets():
     """Update CONFIG from secrets after they're loaded"""
     if get_secret('ENABLE_LIVE_TRADING', '').lower() == 'true':
         CONFIG.enable_live_trading = True
+
+    blocked_hours_value = get_secret('BLOCKED_HOURS_UTC')
+    if blocked_hours_value is not None:
+        blocked_hours_value = blocked_hours_value.strip()
+        if blocked_hours_value == '':
+            CONFIG.blocked_hours_utc = []
+            print("✅ Blocked hours disabled (BLOCKED_HOURS_UTC is empty)")
+        else:
+            try:
+                parsed_hours = [int(h.strip()) for h in blocked_hours_value.split(',') if h.strip() != '']
+                invalid_hours = [h for h in parsed_hours if h < 0 or h > 23]
+                if invalid_hours:
+                    print(f"⚠️ Ignoring invalid BLOCKED_HOURS_UTC values (must be 0-23): {invalid_hours}")
+                else:
+                    CONFIG.blocked_hours_utc = parsed_hours
+                    print(f"✅ Blocked hours set from config: {CONFIG.blocked_hours_utc}")
+            except ValueError:
+                print(f"⚠️ Invalid BLOCKED_HOURS_UTC format: {blocked_hours_value} (expected CSV like '1,3,5' or empty)")
     if get_secret('POSITION_SIZE_SOL'):
         try:
             CONFIG.live_position_size_sol = float(get_secret('POSITION_SIZE_SOL'))
