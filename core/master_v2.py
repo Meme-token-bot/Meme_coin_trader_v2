@@ -27,6 +27,8 @@ import sys
 import time
 import json
 import threading
+from urllib import request as urllib_request
+from urllib.error import URLError, HTTPError
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, field, asdict
@@ -663,6 +665,57 @@ class TradingSystem:
             print("✅ PAPER TRADING SYSTEM READY")
         print("="*70)
         self._print_status()
+
+    def _fetch_ec2_public_ipv4(self) -> Optional[str]:
+        """Fetch EC2 public IPv4 from instance metadata (IMDSv2 preferred)."""
+        token = None
+        token_request = urllib_request.Request(
+            "http://169.254.169.254/latest/api/token",
+            method="PUT",
+            headers={"X-aws-ec2-metadata-token-ttl-seconds": "21600"}
+        )
+
+        try:
+            with urllib_request.urlopen(token_request, timeout=1) as response:
+                token = response.read().decode().strip()
+        except Exception:
+            token = None
+
+        ip_request = urllib_request.Request(
+            "http://169.254.169.254/latest/meta-data/public-ipv4",
+            headers={"X-aws-ec2-metadata-token": token} if token else {}
+        )
+
+        try:
+            with urllib_request.urlopen(ip_request, timeout=1) as response:
+                public_ip = response.read().decode().strip()
+                return public_ip or None
+        except (URLError, HTTPError, TimeoutError):
+            return None
+
+    def _resolve_webhook_url(self) -> str:
+        """Resolve a publicly reachable webhook URL for Helius callbacks."""
+        configured_url = get_secret('WEBHOOK_URL')
+        if configured_url and '0.0.0.0' not in configured_url:
+            return configured_url
+
+        public_host = (
+            get_secret('PUBLIC_WEBHOOK_HOST')
+            or os.getenv('EC2_PUBLIC_IPV4')
+            or self._fetch_ec2_public_ipv4()
+        )
+
+        if public_host:
+            resolved_url = f'http://{public_host}:{CONFIG.webhook_port}/webhook/helius'
+            if configured_url and '0.0.0.0' in configured_url:
+                print(f"⚠️ WEBHOOK_URL used 0.0.0.0 and is not externally reachable: {configured_url}")
+            print(f"✅ Using public webhook URL: {resolved_url}")
+            return resolved_url
+
+        fallback_url = configured_url or f'http://127.0.0.1:{CONFIG.webhook_port}/webhook/helius'
+        print("⚠️ Could not auto-detect a public webhook host.")
+        print(f"⚠️ Set WEBHOOK_URL to a public address (current: {fallback_url})")
+        return fallback_url
     
     def _print_status(self):
         status = self.strategist.get_status()
