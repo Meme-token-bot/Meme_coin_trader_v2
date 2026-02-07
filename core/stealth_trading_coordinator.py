@@ -37,7 +37,7 @@ import threading
 import requests
 import logging
 from datetime import datetime, timezone, timedelta
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from dataclasses import dataclass, asdict
 
 logger = logging.getLogger("StealthCoordinator")
@@ -109,7 +109,7 @@ class StealthConfig:
 class JitoBundleExecutor:
     """Executes trades via Jito bundles with dynamic tips"""
     
-    def __init__(self, solana_client: SolanaClient):
+    def __init__(self, solana_client: Optional["SolanaClient"]):
         self.solana_client = solana_client
         self._tip_index = 0
     
@@ -136,6 +136,10 @@ class JitoBundleExecutor:
         Returns:
             Transaction signature if successful
         """
+        if not self.solana_client:
+            logger.warning("Jito execution skipped: Solana RPC client unavailable")
+            return None
+        
         try:
             # 1. Decode swap transaction
             swap_tx_bytes = base64.b64decode(swap_tx_base64)
@@ -410,34 +414,46 @@ class StealthTradingCoordinator:
             key_name = f'HOT_WALLET_{i}'
             burner_name = f'BURNER_ADDRESS_{i}'
             
-            if key_name in secrets:
-                try:
-                    keypair = Keypair.from_base58_string(secrets[key_name])
-                    public_key = str(keypair.pubkey())
-                    
-                    # Find or create wallet entry
-                    if i not in self.wallet_manager.hot_wallets:
-                        from multi_wallet_system import HotWallet
-                        now = datetime.now(timezone.utc)
-                        wallet = HotWallet(
-                            id=i,
-                            keypair=keypair,
-                            public_key=public_key,
-                            burner_address=secrets.get(burner_name, ''),
-                            created_at=now,
-                            expires_at=now + timedelta(days=7)
-                        )
-                        self.wallet_manager.hot_wallets[i] = wallet
-                    else:
-                        # Update existing wallet with keypair
-                        self.wallet_manager.hot_wallets[i].keypair = keypair
-                        if burner_name in secrets:
-                            self.wallet_manager.hot_wallets[i].burner_address = secrets[burner_name]
-                    
-                    logger.info(f"  ✅ Loaded hot wallet {i}: {public_key[:8]}...")
-                    
-                except Exception as e:
-                    logger.error(f"  ❌ Failed to load wallet {i}: {e}")
+            raw_key: Any = secrets.get(key_name)
+
+            # Skip missing or blank entries to avoid noisy errors when secrets are partially populated
+            if raw_key is None:
+                continue
+            if not isinstance(raw_key, str):
+                logger.warning(f"  ⚠️ Skipping wallet {i}: {key_name} must be a string")
+                continue
+
+            private_key = raw_key.strip()
+            if not private_key:
+                continue
+
+            try:
+                keypair = Keypair.from_base58_string(private_key)
+                public_key = str(keypair.pubkey())
+
+                # Find or create wallet entry
+                if i not in self.wallet_manager.hot_wallets:
+                    from multi_wallet_system import HotWallet
+                    now = datetime.now(timezone.utc)
+                    wallet = HotWallet(
+                        id=i,
+                        keypair=keypair,
+                        public_key=public_key,
+                        burner_address=secrets.get(burner_name, ''),
+                        created_at=now,
+                        expires_at=now + timedelta(days=7)
+                    )
+                    self.wallet_manager.hot_wallets[i] = wallet
+                else:
+                    # Update existing wallet with keypair
+                    self.wallet_manager.hot_wallets[i].keypair = keypair
+                    if burner_name in secrets:
+                        self.wallet_manager.hot_wallets[i].burner_address = secrets[burner_name]
+
+                logger.info(f"  ✅ Loaded hot wallet {i}: {public_key[:8]}...")
+
+            except Exception as e:
+                logger.error(f"  ❌ Failed to load wallet {i}: {e}")
     
     def can_trade(self, signal: Dict) -> Tuple[bool, str]:
         """Check if we can execute a trade"""

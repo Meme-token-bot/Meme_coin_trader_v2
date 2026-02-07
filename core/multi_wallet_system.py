@@ -607,6 +607,9 @@ class MultiWalletManager:
         if wallet_id not in self.hot_wallets:
             return 0.0
         
+        if not self.solana_client:
+            return 0.0
+        
         wallet = self.hot_wallets[wallet_id]
         
         try:
@@ -783,6 +786,10 @@ class MultiWalletManager:
         """
         wallet = self.hot_wallets.get(wallet_id)
         if not wallet or not wallet.burner_address:
+            return None
+        
+        if not self.solana_client:
+            logger.warning("Harvest skipped: Solana RPC client unavailable")
             return None
         
         try:
