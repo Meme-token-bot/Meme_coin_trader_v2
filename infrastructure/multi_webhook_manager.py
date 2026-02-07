@@ -56,6 +56,9 @@ class MultiWebhookManager:
         
         # Load existing webhooks
         self.webhooks = self._load_webhooks()
+
+        # Ensure existing registered webhooks point to the configured callback URL
+        self._sync_existing_webhook_urls()
         
         print(f"✅ Multi-Webhook Manager initialized")
         print(f"   Active webhooks: {len(self.webhooks)}")
@@ -183,6 +186,42 @@ class MultiWebhookManager:
         if response:
             return response.json()
         return None
+    
+    def _sync_existing_webhook_urls(self):
+        """Update existing webhook callback URLs in Helius if they differ from config."""
+        if not self.webhooks:
+            return
+
+        for webhook_id in list(self.webhooks.keys()):
+            current = self._get_webhook_details(webhook_id)
+            if not current:
+                continue
+
+            current_url = (current.get('webhookURL') or '').strip()
+            if current_url == self.webhook_url:
+                continue
+
+            payload = {
+                "webhookURL": self.webhook_url,
+                "accountAddresses": current.get('accountAddresses', []),
+                "webhookType": current.get('webhookType', 'enhanced'),
+                "transactionTypes": current.get('transactionTypes', ['SWAP'])
+            }
+            url = f"{self.base_url}/{webhook_id}?api-key={self.api_key}"
+            response = self._api_call_with_retry('put', url, json=payload)
+
+            if response:
+                with self.db.connection() as conn:
+                    conn.execute(
+                        """
+                        UPDATE webhook_registry
+                        SET webhook_url = ?, last_updated = ?
+                        WHERE webhook_id = ?
+                        """,
+                        (self.webhook_url, datetime.now(), webhook_id)
+                    )
+                self.webhooks[webhook_id]['url'] = self.webhook_url
+                print(f"   🔄 Updated webhook URL for {webhook_id[:8]}... → {self.webhook_url}")
     
     def _create_new_webhook(self) -> Optional[str]:
         """Create a new webhook with Helius"""

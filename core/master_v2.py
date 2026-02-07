@@ -177,6 +177,41 @@ class MasterConfig:
 
 CONFIG = MasterConfig()
 
+def _resolve_webhook_url() -> Optional[str]:
+    """Resolve the callback URL used for Helius webhook registrations."""
+    webhook_url = (get_secret('WEBHOOK_URL') or os.getenv('WEBHOOK_URL') or '').strip()
+    if webhook_url:
+        return webhook_url
+
+    public_base = (
+        get_secret('PUBLIC_WEBHOOK_BASE_URL')
+        or os.getenv('PUBLIC_WEBHOOK_BASE_URL')
+        or ''
+    ).strip()
+    if public_base:
+        return f"{public_base.rstrip('/')}/webhook/helius"
+
+    return None
+
+
+def _is_publicly_reachable_webhook_url(url: str) -> bool:
+    """Basic validation to avoid registering non-routable webhook URLs with Helius."""
+    from urllib.parse import urlparse
+
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False
+
+    if parsed.scheme not in {'http', 'https'}:
+        return False
+
+    host = (parsed.hostname or '').lower()
+    if host in {'', '0.0.0.0', 'localhost', '127.0.0.1', '::1'}:
+        return False
+
+    return True
+
 # Override from secrets/environment
 # Note: This happens after secrets are initialized in the imports
 def _update_config_from_secrets():
@@ -588,14 +623,24 @@ class TradingSystem:
         self.rate_limiter = RateLimiter(CONFIG.max_token_lookups_per_minute, CONFIG.max_api_calls_per_hour)
         self.diagnostics = DiagnosticsTracker()
         
-        webhook_url = get_secret('WEBHOOK_URL') or f'http://0.0.0.0:{CONFIG.webhook_port}/webhook/helius'
+        webhook_url = _resolve_webhook_url()
 
-        try:
-            from infrastructure.multi_webhook_manager import MultiWebhookManager
-            self.multi_webhook_manager = MultiWebhookManager(self.helius_key, webhook_url, self.db)
-            print(f"  ✅ Multi-Webhook Manager")
-        except Exception as e:
+        if webhook_url and _is_publicly_reachable_webhook_url(webhook_url):
+            if webhook_url.startswith('http://'):
+                print("  ⚠️ WEBHOOK_URL is HTTP; HTTPS is recommended for public reliability")
+
+            try:
+                from infrastructure.multi_webhook_manager import MultiWebhookManager
+                self.multi_webhook_manager = MultiWebhookManager(self.helius_key, webhook_url, self.db)
+                print(f"  ✅ Multi-Webhook Manager")
+                print(f"     URL: {webhook_url}")
+            except Exception as e:
+                print(f"  ⚠️ Multi-Webhook Manager init failed: {e}")
+                self.multi_webhook_manager = None
+        else:
             self.multi_webhook_manager = None
+            print("  ⚠️ Multi-Webhook Manager disabled: set WEBHOOK_URL (or PUBLIC_WEBHOOK_BASE_URL) to a public URL")
+            print("     Example: https://your-domain.com/webhook/helius")
 
         if CONFIG.discovery_enabled:
             discovery_key = get_secret('HELIUS_DISCOVERY_KEY')
