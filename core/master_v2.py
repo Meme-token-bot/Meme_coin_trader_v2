@@ -62,7 +62,7 @@ from core.discovery_integration import HistorianV8 as Historian
 from core.strategist_v2 import Strategist
 from core.discovery_config import config as discovery_config
 from infrastructure.helius_webhook_manager import HeliusWebhookManager
-from core.stealth_trading_coordinator import StealthTradingCoordinator
+from core.stealth_trading_coordinator import StealthTradingCoordinator, StealthConfig
 
 # ============================================================================
 # IMPORT FIXED V6 PAPER TRADING PLATFORM
@@ -550,14 +550,7 @@ class TradingSystem:
         else:
             self.paper_engine = None
 
-        # Initialize stealth coordinator
-        self.stealth = StealthTradingCoordinator(
-            helius_key=self.helius_key,
-            telegram_token=get_secret('TELEGRAM_BOT_TOKEN'),
-            telegram_chat_id=get_secret('TELEGRAM_CHAT_ID')
-        )
-
-        # Load wallet keys
+        # Load wallet secrets first so we can size stealth wallet slots from operator-provided keys
         wallet_secrets = {
             'HOT_WALLET_1': get_secret('HOT_WALLET_1'),
             'HOT_WALLET_2': get_secret('HOT_WALLET_2'),
@@ -570,6 +563,24 @@ class TradingSystem:
             'BURNER_ADDRESS_4': get_secret('BURNER_ADDRESS_4'),
             'BURNER_ADDRESS_5': get_secret('BURNER_ADDRESS_5')
         }
+
+        configured_hot_wallets = sum(
+            1
+            for i in range(1, 6)
+            if isinstance(wallet_secrets.get(f'HOT_WALLET_{i}'), str)
+            and wallet_secrets.get(f'HOT_WALLET_{i}').strip()
+        )
+
+        stealth_config = StealthConfig(num_hot_wallets=max(1, configured_hot_wallets))
+
+        # Initialize stealth coordinator
+        self.stealth = StealthTradingCoordinator(
+            helius_key=self.helius_key,
+            telegram_token=get_secret('TELEGRAM_BOT_TOKEN'),
+            telegram_chat_id=get_secret('TELEGRAM_CHAT_ID'),
+            config=stealth_config
+        )
+        
         self.stealth.load_wallet_keys(wallet_secrets)
 
         # Start background tasks

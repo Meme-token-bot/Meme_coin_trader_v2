@@ -69,6 +69,9 @@ except ImportError:
 @dataclass
 class StealthConfig:
     """Configuration for stealth trading"""
+
+    # Wallet rollout
+    num_hot_wallets: int = 1
     
     # Position sizing
     position_size_sol: float = 0.3
@@ -362,6 +365,7 @@ class StealthTradingCoordinator:
         
         # Initialize multi-wallet manager
         multi_config = MultiWalletConfig(
+            num_hot_wallets=self.config.num_hot_wallets,
             position_size_sol=self.config.position_size_sol,
             max_positions_per_wallet=self.config.max_positions_per_wallet,
             total_max_positions=self.config.total_max_positions,
@@ -397,26 +401,13 @@ class StealthTradingCoordinator:
         logger.info(f"   Max positions: {self.config.total_max_positions}")
     
     def load_wallet_keys(self, secrets: Dict[str, str]):
-        """
-        Load wallet keys from AWS Secrets Manager data.
-        
-        Expected secrets format:
-        {
-            'HOT_WALLET_1': 'base58_private_key',
-            'HOT_WALLET_2': 'base58_private_key',
-            ...
-            'BURNER_ADDRESS_1': 'public_key',
-            'BURNER_ADDRESS_2': 'public_key',
-            ...
-        }
-        """
+        """Load only operator-provided wallets from Secrets Manager."""
+        loaded_ids = []
         for i in range(1, 6):
             key_name = f'HOT_WALLET_{i}'
             burner_name = f'BURNER_ADDRESS_{i}'
-            
-            raw_key: Any = secrets.get(key_name)
 
-            # Skip missing or blank entries to avoid noisy errors when secrets are partially populated
+            raw_key: Any = secrets.get(key_name)
             if raw_key is None:
                 continue
             if not isinstance(raw_key, str):
@@ -427,33 +418,44 @@ class StealthTradingCoordinator:
             if not private_key:
                 continue
 
+            burner_raw = secrets.get(burner_name, '')
+            burner_address = burner_raw.strip() if isinstance(burner_raw, str) else ''
+
             try:
-                keypair = Keypair.from_base58_string(private_key)
-                public_key = str(keypair.pubkey())
-
-                # Find or create wallet entry
-                if i not in self.wallet_manager.hot_wallets:
-                    from multi_wallet_system import HotWallet
-                    now = datetime.now(timezone.utc)
-                    wallet = HotWallet(
-                        id=i,
-                        keypair=keypair,
-                        public_key=public_key,
-                        burner_address=secrets.get(burner_name, ''),
-                        created_at=now,
-                        expires_at=now + timedelta(days=7)
-                    )
-                    self.wallet_manager.hot_wallets[i] = wallet
-                else:
-                    # Update existing wallet with keypair
-                    self.wallet_manager.hot_wallets[i].keypair = keypair
-                    if burner_name in secrets:
-                        self.wallet_manager.hot_wallets[i].burner_address = secrets[burner_name]
-
-                logger.info(f"  ✅ Loaded hot wallet {i}: {public_key[:8]}...")
+                wallet = self.wallet_manager.upsert_wallet_from_secret(
+                    wallet_id=i,
+                    private_key=private_key,
+                    burner_address=burner_address
+                )
+                loaded_ids.append(i)
+                logger.info(f"  ✅ Loaded hot wallet {i}: {wallet.public_key[:8]}...")
 
             except Exception as e:
                 logger.error(f"  ❌ Failed to load wallet {i}: {e}")
+
+        if not loaded_ids:
+            logger.error("❌ No HOT_WALLET_n secrets loaded; stealth trading will be disabled")
+            self.wallet_manager.hot_wallets = {}
+            self.wallet_manager.set_active_wallet_ids([])
+            self.config.num_hot_wallets = 0
+            self.wallet_manager.config.num_hot_wallets = 0
+            return
+
+        self.config.num_hot_wallets = len(loaded_ids)
+        self.wallet_manager.config.num_hot_wallets = len(loaded_ids)
+        self.wallet_manager.set_active_wallet_ids(loaded_ids)
+
+        # Keep in-memory registry restricted to the active wallet IDs only
+        self.wallet_manager.hot_wallets = {
+            wid: wallet for wid, wallet in self.wallet_manager.hot_wallets.items()
+            if wid in set(loaded_ids)
+        }
+        self.wallet_manager.wallet_positions = {
+            wid: self.wallet_manager.wallet_positions.get(wid, [])
+            for wid in loaded_ids
+        }
+
+        logger.info(f"✅ Active hot wallets from Secrets Manager: {sorted(loaded_ids)}")
     
     def can_trade(self, signal: Dict) -> Tuple[bool, str]:
         """Check if we can execute a trade"""
@@ -474,8 +476,8 @@ class StealthTradingCoordinator:
         
         # Check total position limit
         total_positions = sum(
-            len(self.wallet_manager.get_wallet_positions(i)) 
-            for i in range(1, 6)
+            len(self.wallet_manager.get_wallet_positions(i))
+            for i in self.wallet_manager.hot_wallets.keys()
         )
         if total_positions >= self.config.total_max_positions:
             return False, f"Total position limit reached ({total_positions})"

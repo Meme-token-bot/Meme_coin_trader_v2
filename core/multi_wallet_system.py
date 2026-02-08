@@ -127,8 +127,9 @@ class MultiWalletConfig:
     """Configuration for multi-wallet stealth trading"""
     
     # Wallet management
-    num_hot_wallets: int = 5
-    wallet_lifespan_days: int = 7              # Rotate wallets weekly
+    num_hot_wallets: int = 1
+    wallet_lifespan_days: int = 14              # Rotate wallets weekly
+    auto_create_wallets: bool = False 
     
     # Position sizing
     position_size_sol: float = 0.3             # Per trade
@@ -414,7 +415,7 @@ class MultiWalletManager:
         self.hot_wallets: Dict[int, HotWallet] = {}
         
         # Position tracking per wallet
-        self.wallet_positions: Dict[int, List[Dict]] = {i: [] for i in range(1, 6)}
+        self.wallet_positions: Dict[int, List[Dict]] = {i: [] for i in range(1, self.config.num_hot_wallets + 1)}
         
         # Thread safety
         self._lock = threading.Lock()
@@ -490,46 +491,99 @@ class MultiWalletManager:
             conn.commit()
     
     def _load_or_create_wallets(self):
-        """Load existing wallets from DB or create new ones"""
+        """Load wallets from DB and optionally auto-create missing slots."""
         with sqlite3.connect(self.db_path) as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
-                "SELECT * FROM wallets WHERE is_active = 1"
+                "SELECT * FROM wallets WHERE is_active = 1 ORDER BY id"
             ).fetchall()
             
-            if len(rows) >= self.config.num_hot_wallets:
-                # Load existing wallets
-                for row in rows[:self.config.num_hot_wallets]:
-                    try:
-                        # Decrypt private key (in production, use proper encryption)
-                        private_key = self._decrypt_key(row['private_key_encrypted'])
-                        keypair = Keypair.from_base58_string(private_key)
-                        
-                        wallet = HotWallet(
-                            id=row['id'],
-                            keypair=keypair,
-                            public_key=row['public_key'],
-                            burner_address=row['burner_address'] or '',
-                            created_at=datetime.fromisoformat(row['created_at']),
-                            expires_at=datetime.fromisoformat(row['expires_at']),
-                            total_trades=row['total_trades'],
-                            total_pnl_sol=row['total_pnl_sol']
-                        )
-                        self.hot_wallets[wallet.id] = wallet
-                        logger.info(f"  ✅ Loaded wallet {wallet.id}: {wallet.public_key[:8]}...")
-                    except Exception as e:
-                        logger.error(f"  ❌ Failed to load wallet {row['id']}: {e}")
-            
-            # Create missing wallets
-            existing_ids = set(self.hot_wallets.keys())
-            for i in range(1, self.config.num_hot_wallets + 1):
-                if i not in existing_ids:
-                    logger.info(f"  🆕 Creating new hot wallet {i}...")
-                    # Note: In production, you'd generate these externally
-                    # and import via AWS Secrets Manager
-                    wallet = self._create_wallet(i)
-                    if wallet:
-                        self.hot_wallets[i] = wallet
+            for row in rows[:self.config.num_hot_wallets]:
+                try:
+                    private_key = self._decrypt_key(row['private_key_encrypted'])
+                    keypair = Keypair.from_base58_string(private_key)
+
+                    wallet = HotWallet(
+                        id=row['id'],
+                        keypair=keypair,
+                        public_key=row['public_key'],
+                        burner_address=row['burner_address'] or '',
+                        created_at=datetime.fromisoformat(row['created_at']),
+                        expires_at=datetime.fromisoformat(row['expires_at']),
+                        total_trades=row['total_trades'],
+                        total_pnl_sol=row['total_pnl_sol']
+                    )
+                    self.hot_wallets[wallet.id] = wallet
+                    logger.info(f"  ✅ Loaded wallet {wallet.id}: {wallet.public_key[:8]}...")
+                except Exception as e:
+                    logger.error(f"  ❌ Failed to load wallet {row['id']}: {e}")
+
+            if self.config.auto_create_wallets:
+                existing_ids = set(self.hot_wallets.keys())
+                for i in range(1, self.config.num_hot_wallets + 1):
+                    if i not in existing_ids:
+                        logger.info(f"  🆕 Creating new hot wallet {i}...")
+                        wallet = self._create_wallet(i)
+                        if wallet:
+                            self.hot_wallets[i] = wallet
+            elif not self.hot_wallets:
+                logger.warning("⚠️ No active hot wallets loaded from database; waiting for secrets-managed wallets")
+
+    def set_active_wallet_ids(self, active_wallet_ids: List[int]):
+        """Deactivate DB wallets that are not in the active secret-managed set."""
+        active_set = set(active_wallet_ids)
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("UPDATE wallets SET is_active = 0")
+            if active_set:
+                conn.executemany(
+                    "UPDATE wallets SET is_active = 1 WHERE id = ?",
+                    [(wid,) for wid in sorted(active_set)]
+                )
+            conn.commit()
+
+    def upsert_wallet_from_secret(self, wallet_id: int, private_key: str, burner_address: str = "") -> HotWallet:
+        """Create/update a wallet from Secrets Manager-controlled keys."""
+        keypair = Keypair.from_base58_string(private_key)
+        public_key = str(keypair.pubkey())
+
+        now = datetime.now(timezone.utc)
+        expires = now + timedelta(days=self.config.wallet_lifespan_days)
+
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            existing = conn.execute(
+                "SELECT created_at, expires_at FROM wallets WHERE id = ?",
+                (wallet_id,)
+            ).fetchone()
+
+            created_at = existing['created_at'] if existing and existing['created_at'] else now.isoformat()
+            expires_at = existing['expires_at'] if existing and existing['expires_at'] else expires.isoformat()
+
+            encrypted_key = self._encrypt_key(private_key)
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO wallets
+                (id, public_key, private_key_encrypted, burner_address, created_at, expires_at, total_trades, total_pnl_sol, is_active)
+                VALUES (?, ?, ?, ?, ?, ?,
+                        COALESCE((SELECT total_trades FROM wallets WHERE id = ?), 0),
+                        COALESCE((SELECT total_pnl_sol FROM wallets WHERE id = ?), 0),
+                        1)
+                """,
+                (wallet_id, public_key, encrypted_key, burner_address, created_at, expires_at, wallet_id, wallet_id)
+            )
+            conn.commit()
+
+        wallet = HotWallet(
+            id=wallet_id,
+            keypair=keypair,
+            public_key=public_key,
+            burner_address=burner_address,
+            created_at=datetime.fromisoformat(created_at),
+            expires_at=datetime.fromisoformat(expires_at)
+        )
+        self.hot_wallets[wallet_id] = wallet
+        self.wallet_positions.setdefault(wallet_id, [])
+        return wallet
     
     def _create_wallet(self, wallet_id: int) -> Optional[HotWallet]:
         """Create a new hot wallet"""
