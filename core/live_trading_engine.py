@@ -501,6 +501,16 @@ class TaxDatabase:
                     fees_sol REAL DEFAULT 0
                 )
             """)
+
+            daily_stats_columns = {
+                row[1] for row in conn.execute("PRAGMA table_info(daily_stats)").fetchall()
+            }
+            if "pnl_sol" not in daily_stats_columns:
+                conn.execute("ALTER TABLE daily_stats ADD COLUMN pnl_sol REAL DEFAULT 0")
+            if "pnl_nzd" not in daily_stats_columns:
+                conn.execute("ALTER TABLE daily_stats ADD COLUMN pnl_nzd REAL DEFAULT 0")
+            if "fees_sol" not in daily_stats_columns:
+                conn.execute("ALTER TABLE daily_stats ADD COLUMN fees_sol REAL DEFAULT 0")
             
             # Execution log
             conn.execute("""
