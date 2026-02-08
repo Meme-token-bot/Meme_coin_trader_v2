@@ -489,6 +489,37 @@ class SolTokenSwapper:
 
         log.warning("Tx %s confirmation timed out after %.0fs", signature, timeout_s)
         return False
+    
+    async def _get_tx_error(self, signature: str) -> Optional[dict]:
+        """Fetch on-chain transaction error (if any)."""
+        session = await self._get_session()
+        rpc = {
+            "jsonrpc": "2.0",
+            "id": "1",
+            "method": "getSignatureStatuses",
+            "params": [[signature], {"searchTransactionHistory": True}],
+        }
+        await self.limiter.acquire()
+        async with session.post(self.helius_rpc_url, json=rpc) as resp:
+            data = await resp.json()
+
+        statuses = data.get("result", {}).get("value", [None])
+        status = statuses[0] if statuses else None
+        if status and status.get("err"):
+            return status["err"]
+        return None
+
+    @staticmethod
+    def _is_terminal_error(err: dict) -> bool:
+        """Check whether an on-chain error is terminal/non-retryable."""
+        terminal_custom_codes = {6024, 6003, 1}
+        if isinstance(err, dict) and "InstructionError" in err:
+            ix_err = err["InstructionError"]
+            if isinstance(ix_err, list) and len(ix_err) >= 2:
+                custom = ix_err[1]
+                if isinstance(custom, dict) and "Custom" in custom:
+                    return custom["Custom"] in terminal_custom_codes
+        return False
 
     # ── Public API ───────────────────────────────────────────────────────
     async def swap(self, cfg: SwapConfig) -> SwapResult:
@@ -541,6 +572,14 @@ class SolTokenSwapper:
                         elapsed_ms=elapsed,
                     )
                 else:
+                    on_chain_err = await self._get_tx_error(sig)
+                    if on_chain_err and self._is_terminal_error(on_chain_err):
+                        log.error("Terminal on-chain error (not retryable): %s", on_chain_err)
+                        return SwapResult(
+                            success=False,
+                            error=f"Terminal error: {on_chain_err}",
+                            elapsed_ms=elapsed,
+                        )
                     log.warning("Tx sent but not confirmed – retrying…")
 
             except Exception as exc:

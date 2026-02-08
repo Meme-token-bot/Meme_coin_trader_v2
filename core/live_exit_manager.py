@@ -378,6 +378,12 @@ class LiveExitManager:
             return result
         
         try:
+            current_positions = self.tax_db.get_positions()
+            if not any(p.get('token_address') == token_address for p in current_positions):
+                logger.info(f"⏭️ Position {token_symbol} already closed, skipping")
+                result['error'] = 'Position already closed'
+                return result
+            
             logger.info(f"🔄 Executing exit for {token_symbol} | Reason: {reason.value}")
             
             # Use the existing engine's execute_sell method

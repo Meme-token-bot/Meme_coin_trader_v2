@@ -665,6 +665,16 @@ class TaxDatabase:
         today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
         
         with self._get_connection() as conn:
+            columns = {
+                row[1] for row in conn.execute("PRAGMA table_info(daily_stats)").fetchall()
+            }
+            if "pnl_sol" not in columns:
+                conn.execute("ALTER TABLE daily_stats ADD COLUMN pnl_sol REAL DEFAULT 0")
+                logger.warning("Applied missing pnl_sol column migration to daily_stats")
+            if "fees_sol" not in columns:
+                conn.execute("ALTER TABLE daily_stats ADD COLUMN fees_sol REAL DEFAULT 0")
+                logger.warning("Applied missing fees_sol column migration to daily_stats")
+
             existing = conn.execute(
                 "SELECT * FROM daily_stats WHERE date = ?", (today,)
             ).fetchone()
@@ -1312,7 +1322,25 @@ class LiveTradingEngine:
             
             # Calculate token amount in smallest unit
             decimals = self._get_token_decimals(token_address)
-            token_amount = int(Decimal(str(tokens_held)) * (10 ** decimals))
+            on_chain_balance = self._get_token_balance(token_address)
+            if on_chain_balance is not None and on_chain_balance > 0:
+                token_amount = int(on_chain_balance)
+                actual_tokens = on_chain_balance / (10 ** decimals)
+                if abs(actual_tokens - float(tokens_held)) > 0.001:
+                    logger.warning(
+                        f"⚠️ Balance mismatch for {token_symbol}: "
+                        f"DB={float(tokens_held):.6f} vs chain={actual_tokens:.6f}"
+                    )
+            elif on_chain_balance == 0:
+                logger.warning(
+                    f"⚠️ On-chain balance is 0 for {token_symbol} — position may already be closed"
+                )
+                self.tax_db.remove_position(token_address)
+                result['error'] = "Token balance is 0 on-chain (already sold?)"
+                return result
+            else:
+                token_amount = int(Decimal(str(tokens_held)) * (10 ** decimals))
+
             if token_amount <= 0:
                 result['error'] = "Token amount is too small to swap"
                 return result
@@ -1429,11 +1457,22 @@ class LiveTradingEngine:
                 'notes': f"Exit reason: {exit_reason}",
                 'is_live': True
             }
-            self.tax_db.record_trade(trade_data)
-            
-            # Update daily stats
+
             is_win = pnl_sol > 0
-            self.tax_db.update_daily_stats(pnl_sol, is_win, fee_sol)
+            
+            # CRITICAL: remove position first once on-chain sell is confirmed.
+            # Downstream analytics failures must not leave ghost positions.
+            self.tax_db.remove_position(token_address)
+
+            try:
+                self.tax_db.record_trade(trade_data)
+            except Exception as db_err:
+                logger.error(f"⚠️ Failed to record trade (non-fatal): {db_err}")
+
+            try:
+                self.tax_db.update_daily_stats(pnl_sol, is_win, fee_sol)
+            except Exception as stats_err:
+                logger.error(f"⚠️ Failed to update daily stats (non-fatal): {stats_err}")
             
             # Update consecutive losses
             with self._lock:
@@ -1444,16 +1483,15 @@ class LiveTradingEngine:
                     if self._consecutive_losses >= self.config.max_consecutive_losses:
                         self._trigger_cool_down()
             
-            # Remove position
-            self.tax_db.remove_position(token_address)
-            
-            # Log
-            self.tax_db.log_execution('SELL', token_address, token_symbol, 'SUCCESS',
-                                      signature=signature, details={
-                                          'exit_reason': exit_reason,
-                                          'pnl_sol': pnl_sol,
-                                          'pnl_pct': pnl_pct
-                                      })
+            try:
+                self.tax_db.log_execution('SELL', token_address, token_symbol, 'SUCCESS',
+                                          signature=signature, details={
+                                              'exit_reason': exit_reason,
+                                              'pnl_sol': pnl_sol,
+                                              'pnl_pct': pnl_pct
+                                          })
+            except Exception as log_err:
+                logger.error(f"⚠️ Failed to log execution (non-fatal): {log_err}")
             
             result['success'] = True
             result['signature'] = signature
@@ -2168,6 +2206,45 @@ class LiveTradingEngine:
         except Exception as exc:
             logger.warning(f"Failed to fetch decimals for {mint}: {exc}. Defaulting to 6.")
             return 6
+
+    def _get_token_balance(self, token_mint: str) -> Optional[int]:
+        """Get current wallet token balance in raw units for a mint."""
+        if not self.rpc_url or not self.wallet_pubkey:
+            return None
+
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getTokenAccountsByOwner",
+            "params": [
+                self.wallet_pubkey,
+                {"mint": token_mint},
+                {"encoding": "jsonParsed"},
+            ],
+        }
+        try:
+            response = requests.post(self.rpc_url, json=payload, timeout=20)
+            response.raise_for_status()
+            accounts = response.json().get("result", {}).get("value", [])
+            if not accounts:
+                return 0
+
+            total = 0
+            for account in accounts:
+                amount = (
+                    account.get("account", {})
+                    .get("data", {})
+                    .get("parsed", {})
+                    .get("info", {})
+                    .get("tokenAmount", {})
+                    .get("amount")
+                )
+                if amount is not None:
+                    total += int(amount)
+            return total
+        except Exception as exc:
+            logger.error(f"Failed to get on-chain balance for {token_mint}: {exc}")
+            return None
 
     def _prepare_legacy_swap(self, swap_tx_base64: str) -> Optional[str]:
         """Ensure a swap transaction is legacy encoded for Helius sender."""
