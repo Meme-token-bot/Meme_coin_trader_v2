@@ -90,23 +90,27 @@ class LiveTradingIntegration:
         self.config = config or IntegrationConfig()
         self.notifier = notifier
         
-        # Initialize exit manager
-        from core.live_exit_manager import LiveExitManager, ExitConfig
-        
-        exit_config = ExitConfig(
-            default_stop_loss_pct=self.config.stop_loss_pct,
-            default_take_profit_pct=self.config.take_profit_pct,
-            default_trailing_stop_pct=self.config.trailing_stop_pct,
-            max_hold_hours=self.config.max_hold_hours,
-            enable_auto_exits=True,
-            enable_notifications=self.config.enable_notifications
-        )
-        
-        self.exit_manager = LiveExitManager(
-            trading_engine=engine,
-            config=exit_config,
-            notifier=notifier
-        )
+        # Reuse engine exit manager when available to avoid duplicate monitors/threads
+        if hasattr(engine, 'exit_monitor') and engine.exit_monitor is not None:
+            self.exit_manager = engine.exit_monitor
+            logger.info("♻️ Reusing engine LiveExitManager")
+        else:
+            from core.live_exit_manager import LiveExitManager, ExitConfig
+
+            exit_config = ExitConfig(
+                default_stop_loss_pct=self.config.stop_loss_pct,
+                default_take_profit_pct=self.config.take_profit_pct,
+                default_trailing_stop_pct=self.config.trailing_stop_pct,
+                max_hold_hours=self.config.max_hold_hours,
+                enable_auto_exits=True,
+                enable_notifications=self.config.enable_notifications
+            )
+
+            self.exit_manager = LiveExitManager(
+                trading_engine=engine,
+                config=exit_config,
+                notifier=notifier
+            )
         
         # State
         self._lock = threading.RLock()
@@ -263,10 +267,15 @@ class LiveTradingIntegration:
     
     def start_exit_monitoring(self):
         """Start background exit monitoring"""
+        if getattr(self.exit_manager, '_monitor_running', False):
+            logger.info("Exit monitoring already running; skipping duplicate start")
+            return
         self.exit_manager.start_monitoring()
     
     def stop_exit_monitoring(self):
         """Stop background exit monitoring"""
+        if not getattr(self.exit_manager, '_monitor_running', False):
+            return
         self.exit_manager.stop_monitoring()
     
     def check_exits_now(self) -> List[Dict]:

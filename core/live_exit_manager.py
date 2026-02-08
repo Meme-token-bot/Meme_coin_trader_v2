@@ -132,6 +132,7 @@ class LiveExitManager:
         self._ws_stop = threading.Event()
         self._wake_event = threading.Event()
         self._vault_refresh = threading.Event()
+        self._last_no_vault_log = None
         self._lock = threading.RLock()
         
         # State tracking
@@ -490,7 +491,10 @@ class LiveExitManager:
         while not self._ws_stop.is_set():
             vaults = self._get_vault_addresses()
             if not vaults:
-                logger.info("Exit websocket: no vault addresses found; sleeping.")
+                now = time.time()
+                if self._last_no_vault_log is None or now - self._last_no_vault_log >= 60:
+                    logger.info("Exit websocket: no vault addresses found in open live positions; sleeping.")
+                    self._last_no_vault_log = now
                 await asyncio.sleep(self.config.websocket_reconnect_seconds)
                 continue
 
