@@ -139,6 +139,10 @@ class LiveExitManager:
         self._consecutive_failures = 0
         self._last_check_time = None
         self._last_liquidity = {}  # Cache liquidity per token
+
+        self._exit_in_flight = set()  # token addresses currently being exited
+        self._exit_retry_after = {}   # token_address -> unix timestamp
+        self._exit_failure_counts = {}
         
         logger.info("🔄 LiveExitManager initialized (using existing engine)")
     
@@ -308,6 +312,37 @@ class LiveExitManager:
     # =========================================================================
     # EXIT EXECUTION
     # =========================================================================
+
+    def _check_exit_throttle(self, token_address: str) -> Tuple[bool, Optional[str]]:
+        """Check whether this token can attempt a new exit now."""
+        now = time.time()
+        with self._lock:
+            if token_address in self._exit_in_flight:
+                return False, "exit already in progress"
+
+            retry_after = self._exit_retry_after.get(token_address, 0)
+            if retry_after and now < retry_after:
+                wait_s = max(1, int(retry_after - now))
+                return False, f"cooldown active ({wait_s}s remaining)"
+
+            self._exit_in_flight.add(token_address)
+            return True, None
+
+    def _record_exit_result(self, token_address: str, success: bool):
+        """Update in-flight and backoff state after an exit attempt."""
+        now = time.time()
+        with self._lock:
+            self._exit_in_flight.discard(token_address)
+
+            if success:
+                self._exit_failure_counts.pop(token_address, None)
+                self._exit_retry_after.pop(token_address, None)
+                return
+
+            failures = self._exit_failure_counts.get(token_address, 0) + 1
+            self._exit_failure_counts[token_address] = failures
+            backoff_seconds = min(30, 2 ** min(failures, 4))  # 2,4,8,16,30...
+            self._exit_retry_after[token_address] = now + backoff_seconds
     
     def execute_exit(self, position: Dict, reason: ExitReason, metrics: Dict = None) -> Dict:
         """
@@ -335,6 +370,12 @@ class LiveExitManager:
             'error': None,
             'metrics': metrics or {}
         }
+
+        allowed, throttle_reason = self._check_exit_throttle(token_address)
+        if not allowed:
+            result['error'] = throttle_reason
+            logger.info(f"⏭️ Skipping exit for {token_symbol}: {throttle_reason}")
+            return result
         
         try:
             logger.info(f"🔄 Executing exit for {token_symbol} | Reason: {reason.value}")
@@ -376,6 +417,9 @@ class LiveExitManager:
             logger.error(f"❌ Exit exception for {token_symbol}: {e}")
             import traceback
             traceback.print_exc()
+        
+        finally:
+            self._record_exit_result(token_address, result.get('success', False))
         
         return result
     
