@@ -641,6 +641,8 @@ def create_hybrid_engine(paper_engine, notifier=None) -> HybridTradingEngine:
         enable_paper_trading=True,  # Always keep paper for comparison
         position_size_sol=float(get_secret('POSITION_SIZE_SOL', '0.08')),
         max_open_positions=int(get_secret('MAX_OPEN_POSITIONS', '10')),
+        max_deployed_sol=float(get_secret('MAX_DEPLOYED_SOL', '0.80')),
+        min_balance_sol=float(get_secret('MIN_BALANCE_SOL', '1.50')),
         max_daily_loss_sol=float(get_secret('MAX_DAILY_LOSS_SOL', '0.25')),
         min_conviction=int(get_secret('MIN_CONVICTION', '60')),
     )
@@ -664,6 +666,8 @@ def create_hybrid_engine(paper_engine, notifier=None) -> HybridTradingEngine:
                 live_config = LiveTradingConfig(
                     position_size_sol=config.position_size_sol,
                     max_open_positions=config.max_open_positions,
+                    max_deployed_sol=config.max_deployed_sol,
+                    min_balance_sol=config.min_balance_sol,
                     max_daily_loss_sol=config.max_daily_loss_sol,
                     min_conviction=config.min_conviction,
                     blocked_hours_utc=config.blocked_hours_utc,

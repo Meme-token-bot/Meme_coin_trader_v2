@@ -194,14 +194,27 @@ class SecretsLoader:
             'WEBHOOK_URL',
             'ANTHROPIC_API_KEY',
             'BIRDEYE_API_KEY',
-            'KRAKEN_API',
-            'KRAKEN_SECRET',
             'SOLANA_PRIVATE_KEY',
             'SOLANA_PUBLIC_KEY',
             'ENABLE_LIVE_TRADING',
             'POSITION_SIZE_SOL',
             'MAX_OPEN_POSITIONS',
+            'MAX_DEPLOYED_SOL',
+            'MIN_BALANCE_SOL',
             'MAX_DAILY_LOSS_SOL',
+            'HOT_WALLET_1',
+            'BURNER_ADDRESS_1',
+            'WALLET_SET_EXPIRES',
+            'QUICKNODE_METIS_URL'
+            'USE_HELIUS_SENDER',
+            'HELIUS_PRIORITY_HEADER',
+            'HELIUS_PRIORITY_VALUE',
+            'HELIUS_SENDER_URL',
+            'JUPITER_API_KEY',
+            'JUPITER_QUOTE_URL',
+            'JUPITER_SWAP_URL',
+            'BLOCKED_HOURS_UTC',
+            'ENABLE_EXIT_WEBSOCKET'
         ]
         
         for var in env_vars:
