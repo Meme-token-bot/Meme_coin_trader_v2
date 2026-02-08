@@ -740,6 +740,9 @@ class LiveTradingEngine:
                  config: LiveTradingConfig = None):
         
         self.config = config or LiveTradingConfig()
+        # Backward compatibility for externally supplied/legacy config objects
+        if not hasattr(self.config, 'exit_slippage_bps'):
+            self.config.exit_slippage_bps = max(getattr(self.config, 'default_slippage_bps', 300), 500)
         if not self.config.enable_live_trading:
             self.config.enable_live_trading = get_secret('ENABLE_LIVE_TRADING', '').lower() == 'true'
         if not self.config.use_helius_sender:
@@ -1297,7 +1300,7 @@ class LiveTradingEngine:
         entry_cost_nzd = position.get('total_cost_nzd', 0)
         
         try:
-            exit_slippage_bps = max(self.config.default_slippage_bps, self.config.exit_slippage_bps)
+            exit_slippage_bps = max(self.config.default_slippage_bps, getattr(self.config, 'exit_slippage_bps', 500))
 
             # Get prices
             sol_usd, sol_nzd = self.price_service.get_sol_prices()
