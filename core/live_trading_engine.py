@@ -35,7 +35,7 @@ import requests
 import logging
 import random
 
-from core.live_exit_manager import LiveExitManager, ExitConfig
+from core.live_exit_manager import LiveExitManager, ExitConfig, WEBSOCKETS_AVAILABLE
 from core.sol_swapper_bridge import SolSwapperBridge
 
 # Configure logging
@@ -165,7 +165,7 @@ class LiveTradingConfig:
     use_helius_sender_for_buys: bool = True # Route buys via Helius sender
     use_helius_sender_for_sells: bool = True # Route sells via Helius sender
     use_sol_swapper_execution: bool = True   # Reuse proven sol-swapper Sender flow
-    enable_exit_websocket: bool = False      # Use Helius WS to trigger exits
+    enable_exit_websocket: bool = True      # Use Helius WS to trigger exits
     exit_websocket_ping_seconds: int = 30    # WS ping interval
     exit_websocket_reconnect_seconds: int = 5 # WS reconnect delay
     
@@ -840,6 +840,21 @@ class LiveTradingEngine:
         helius_ws_url = get_secret("HELIUS_WS_URL")
         if not helius_ws_url and self.helius_key:
             helius_ws_url = f"wss://mainnet.helius-rpc.com/?api-key={self.helius_key}"
+        if self.config.enable_exit_websocket and not WEBSOCKETS_AVAILABLE:
+            logger.warning(
+                "⚠️ ENABLE_EXIT_WEBSOCKET is true, but websockets is not installed. "
+                "Install with `pip install websockets` or set ENABLE_EXIT_WEBSOCKET=false."
+            )
+        if self.config.enable_exit_websocket and not helius_ws_url:
+            logger.warning(
+                "⚠️ ENABLE_EXIT_WEBSOCKET is true, but no Helius websocket URL is configured. "
+                "Set HELIUS_WS_URL or HELIUS_KEY, or disable with ENABLE_EXIT_WEBSOCKET=false."
+            )
+            self.config.enable_exit_websocket = False
+        logger.info(
+            "Exit websocket monitoring: %s",
+            "ENABLED" if self.config.enable_exit_websocket else "DISABLED",
+        )
         self.exit_monitor = LiveExitManager(
             self,
             config=exit_config,

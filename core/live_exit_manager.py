@@ -27,11 +27,17 @@ import time
 import json
 import asyncio
 import requests
-import websockets
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 from enum import Enum
+
+try:
+    import websockets
+    WEBSOCKETS_AVAILABLE = True
+except ImportError:
+    websockets = None
+    WEBSOCKETS_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -105,6 +111,11 @@ class LiveExitManager:
         self.config = config or ExitConfig()
         self.notifier = notifier
         self.config.enable_websocket = enable_websocket
+        if self.config.enable_websocket and not WEBSOCKETS_AVAILABLE:
+            logger.warning(
+                "⚠️ websockets package not installed - disabling websocket exit monitoring"
+            )
+            self.config.enable_websocket = False
         if websocket_ping_seconds is not None:
             self.config.websocket_ping_seconds = websocket_ping_seconds
         if websocket_reconnect_seconds is not None:
