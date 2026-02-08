@@ -642,7 +642,7 @@ def create_hybrid_engine(paper_engine, notifier=None) -> HybridTradingEngine:
         position_size_sol=float(get_secret('POSITION_SIZE_SOL', '0.08')),
         max_open_positions=int(get_secret('MAX_OPEN_POSITIONS', '10')),
         max_deployed_sol=float(get_secret('MAX_DEPLOYED_SOL', '0.80')),
-        min_balance_sol=float(get_secret('MIN_BALANCE_SOL', '1.50')),
+        min_balance_sol=float(get_secret('MIN_BALANCE_SOL', '0.7')),
         max_daily_loss_sol=float(get_secret('MAX_DAILY_LOSS_SOL', '0.25')),
         min_conviction=int(get_secret('MIN_CONVICTION', '60')),
     )
