@@ -147,8 +147,8 @@ class LiveTradingConfig:
     cool_down_minutes: int = 30              # After consecutive losses
     
     # Execution
-    default_slippage_bps: int = 300          # 3% slippage
-    max_slippage_bps: int = 500              # 5% max
+    default_slippage_bps: int = 500          # 3% slippage
+    max_slippage_bps: int = 1000              # 5% max
     jito_tip_lamports: int = 5_000_000       # 0.001 SOL tip
     priority_fee_lamports: int = 100_000     # Priority fee
     enable_dynamic_priority_fees: bool = True  # Fetch priority fees from RPC
@@ -756,6 +756,12 @@ class LiveTradingEngine:
                 self.config.default_slippage_bps = int(slippage_override)
             except ValueError:
                 logger.warning(f"Invalid DEFAULT_SLIPPAGE_BPS: {slippage_override}")
+        exit_slippage_override = get_secret('EXIT_SLIPPAGE_BPS')
+        if exit_slippage_override:
+            try:
+                self.config.exit_slippage_bps = int(exit_slippage_override)
+            except ValueError:
+                logger.warning(f"Invalid EXIT_SLIPPAGE_BPS: {exit_slippage_override}")
         jito_tip_override = get_secret('JITO_TIP_LAMPORTS')
         if jito_tip_override:
             try:
@@ -1291,6 +1297,8 @@ class LiveTradingEngine:
         entry_cost_nzd = position.get('total_cost_nzd', 0)
         
         try:
+            exit_slippage_bps = max(self.config.default_slippage_bps, self.config.exit_slippage_bps)
+
             # Get prices
             sol_usd, sol_nzd = self.price_service.get_sol_prices()
             token_price = self.price_service.get_token_price(token_address)
@@ -1311,7 +1319,7 @@ class LiveTradingEngine:
                 bridge_result = self.sol_swapper_bridge.sell(
                     token_mint=token_address,
                     token_amount_raw=token_amount,
-                    slippage_bps=self.config.default_slippage_bps,
+                    slippage_bps=exit_slippage_bps,
                     priority_fee=self.config.priority_fee_lamports,
                     jito_tip=self.config.jito_tip_lamports,
                 )
@@ -1327,7 +1335,7 @@ class LiveTradingEngine:
                     input_mint=token_address,
                     output_mint=SOL_MINT,
                     amount=token_amount,
-                    slippage_bps=self.config.default_slippage_bps
+                    slippage_bps=exit_slippage_bps
                 )
                 
                 if not quote:
@@ -1359,7 +1367,7 @@ class LiveTradingEngine:
                     input_mint=token_address,
                     output_mint=SOL_MINT,
                     amount=token_amount,
-                    slippage_bps=self.config.default_slippage_bps
+                    slippage_bps=exit_slippage_bps
                 )
                 if retry_quote:
                     retry_swap = self._get_jupiter_swap(

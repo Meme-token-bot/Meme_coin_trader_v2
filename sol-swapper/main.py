@@ -35,12 +35,12 @@ def _build_parser() -> argparse.ArgumentParser:
     # ── sell ─────────────────────────────────────────────────────────────
     sell = sub.add_parser("sell", help="Sell a token for SOL")
     sell.add_argument("token_mint", help="SPL token mint address")
-    sell.add_argument("token_amount", type=int, help="Raw token amount (smallest unit)")
+    sell.add_argument("token_amount", type=str, help="Token amount (human-readable or raw units)")
 
     # ── shared flags ─────────────────────────────────────────────────────
     for sp in (buy, sell):
         sp.add_argument(
-            "--slippage", type=int, default=100,
+            "--slippage", type=int, default=300,
             help="Slippage tolerance in bps (default: 100)",
         )
         sp.add_argument(
@@ -94,9 +94,18 @@ async def _run(args: argparse.Namespace) -> int:
                 jito_tip=args.jito_tip,
             )
         else:
+            # If user passed a decimal, convert to raw units using on-chain decimals
+            raw_amount = args.token_amount
+            if '.' in raw_amount:
+                from decimal import Decimal
+                decimals = await swapper.get_token_decimals(args.token_mint)  # you'll need this method
+                raw_amount = int(Decimal(raw_amount) * (10 ** decimals))
+            else:
+                raw_amount = int(raw_amount)
+
             result = await swapper.sell_token(
                 token_mint=args.token_mint,
-                token_amount_raw=args.token_amount,
+                token_amount_raw=raw_amount,
                 slippage_bps=args.slippage,
                 priority_fee=args.priority_fee,
                 jito_tip=args.jito_tip,

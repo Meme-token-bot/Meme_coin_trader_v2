@@ -588,13 +588,22 @@ class LiveExitManager:
         logger.debug(f"Checking {len(positions)} open positions...")
         
         for position in positions:
+            token_address = position.get('token_address')
+            token_symbol = position.get('token_symbol')
+            with self._lock:
+                if token_address in self._exit_in_flight:
+                    logger.debug(f"Skipping {token_symbol}: exit already in flight")
+                    continue
+
             try:
                 should_exit, reason, metrics = self.check_exit_conditions(position)
                 
                 if should_exit and reason:
                     result = self.execute_exit(position, reason, metrics)
                     
-                    if not result.get('success'):
+                    if not result.get('success') and result.get('error') not in (
+                        'exit already in progress',
+                    ) and not str(result.get('error', '')).startswith('cooldown active'):
                         logger.error(
                             f"Failed to exit {position.get('token_symbol')}: "
                             f"{result.get('error')}"
@@ -610,6 +619,11 @@ class LiveExitManager:
         positions = self.tax_db.get_positions()
         
         for position in positions:
+            token_address = position.get('token_address')
+            with self._lock:
+                if token_address in self._exit_in_flight:
+                    continue
+
             try:
                 should_exit, reason, metrics = self.check_exit_conditions(position)
                 
