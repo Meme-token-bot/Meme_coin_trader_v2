@@ -377,7 +377,7 @@ class Notifier:
         self.token = token or get_secret('TELEGRAM_BOT_TOKEN')
         self.chat_id = chat_id or get_secret('TELEGRAM_CHAT_ID')
         self.enabled = bool(self.token and self.chat_id)
-        self._last_30min_update = datetime.now() - timedelta(minutes=30)
+        self._last_hourly_update = datetime.now() - timedelta(hours=1)
         self._last_stats = {'paper': {}, 'live': {}}
     
     def send(self, message: str):
@@ -394,7 +394,9 @@ class Notifier:
         self.send(f"🚨 <b>CRITICAL</b>\n\n{message}")
     
     def send_entry_alert(self, signal: Dict, decision: Dict, quality = None, is_live: bool = False):
-        """Notify when a position is opened"""
+        """Notify when a position is opened (live only)."""
+        if not is_live:
+            return
         mode = "🔴 LIVE" if is_live else "📝 PAPER"
         token = signal.get('token_symbol', 'UNKNOWN')
         conviction = decision.get('conviction', signal.get('conviction_score', 0))
@@ -418,6 +420,30 @@ Amount: {amount_sol:.4f} SOL
 Conviction: {conviction}%
 Sig: <code>{sig_display}</code>"""
         
+        self.send(msg)
+
+    def send_hourly_live_update(self, diagnostics: Dict, paper_stats: Dict, live_status: Dict):
+        """Send concise hourly update focused on live trading health and PnL."""
+        now = datetime.now()
+        if (now - self._last_hourly_update).total_seconds() < 3600:
+            return
+
+        self._last_hourly_update = now
+
+        live_diag = diagnostics.get('live_trading', {}) if diagnostics else {}
+        live_enabled = bool(live_status.get('enabled')) if live_status else False
+        live_mode = live_status.get('mode', 'unknown') if live_status else 'unknown'
+        balance = paper_stats.get('balance', 0) if paper_stats else 0
+
+        msg = (
+            "📈 <b>Hourly Live Update</b>\n\n"
+            f"Mode: {'🔴 LIVE' if live_enabled else '📝 PAPER'} ({live_mode})\n"
+            f"Live Opened: {live_diag.get('opened', 0)}\n"
+            f"Live Closed: {live_diag.get('closed', 0)}\n"
+            f"Live PnL: {live_diag.get('pnl_sol', 0):+.4f} SOL\n"
+            f"Open Positions: {paper_stats.get('open_positions', 0)}\n"
+            f"Balance: {balance:.4f} SOL"
+        )
         self.send(msg)
 
 
@@ -978,6 +1004,43 @@ class TradingSystem:
         # Paper engine is the source of truth for all open positions.
         return False
 
+    def run_discovery_cycle(self, reason: str = "manual") -> Dict:
+        """Run one discovery cycle and update diagnostics."""
+        if not self.historian:
+            return {'status': 'skipped', 'reason': 'discovery_disabled'}
+
+        stats = self.historian.run_discovery(
+            api_budget=CONFIG.discovery_api_budget,
+            max_wallets=discovery_config.max_new_wallets_per_day
+        )
+
+        wallets_found = stats.get('wallets_verified', 0)
+        self.diagnostics.discoveries_run += 1
+        self.diagnostics.wallets_discovered += wallets_found
+        self.diagnostics.log_event('discovery', f"{reason}: +{wallets_found} wallets")
+
+        return {
+            'status': 'completed',
+            'reason': reason,
+            'wallets_verified': wallets_found,
+            'api_calls': stats.get('helius_api_calls', 0),
+            'raw_stats': stats,
+        }
+
+    def run_learning_cycle(self, force: bool = True, reason: str = "manual") -> Dict:
+        """Run one strategist learning cycle and update diagnostics."""
+        if not self.strategist:
+            return {'status': 'skipped', 'reason': 'strategist_unavailable'}
+
+        result = self.strategist.run_learning_loop(force=force)
+        if result.get('status') == 'completed':
+            self.diagnostics.learning_iterations += 1
+            self.diagnostics.log_event('learning', f"{reason}: completed")
+        elif result.get('status') == 'skipped':
+            self.diagnostics.log_event('learning', f"{reason}: skipped")
+
+        return result
+
 # ============================================================================
 # FLASK APP
 # ============================================================================
@@ -1063,6 +1126,32 @@ def positions():
         'positions': positions
     })
 
+@app.route('/discovery/run', methods=['POST'])
+def run_discovery_now():
+    """Trigger discovery immediately."""
+    global trading_system
+    if not trading_system:
+        return jsonify({'error': 'System not initialized'}), 503
+
+    try:
+        result = trading_system.run_discovery_cycle(reason='api')
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({'status': 'error', 'error': str(e)}), 500
+
+
+@app.route('/learning/run', methods=['POST'])
+def run_learning_now():
+    """Trigger learning loop immediately."""
+    global trading_system
+    if not trading_system:
+        return jsonify({'error': 'System not initialized'}), 503
+
+    try:
+        result = trading_system.run_learning_cycle(force=True, reason='api')
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({'status': 'error', 'error': str(e)}), 500
 
 # ============================================================================
 # NEW: EXIT MANAGER ENDPOINTS
@@ -1157,9 +1246,8 @@ def kill_switch():
 def background_tasks():
     global trading_system
     
-    last_discovery = datetime.now()
-    last_status = datetime.now()
-    last_learning = datetime.now()
+    last_discovery = datetime.now() - timedelta(hours=CONFIG.discovery_interval_hours)
+    last_learning = datetime.now() - timedelta(hours=6)
     last_summary = datetime.now()
     last_live_check = datetime.now()
     last_exit_check = datetime.now()  # NEW
@@ -1194,12 +1282,43 @@ def background_tasks():
                     exit_indicator = f" | 🔄 Exit({open_pos})"
                 
                 print(f"📡 {now.strftime('%H:%M')} | "
-                      f"Webhooks: {d.webhooks_received} | "
-                      f"Signals: {d.buy_signals_detected} | "
-                      f"Opened: {d.positions_opened} | "
+                      f"LIVE Opened: {d.live_trades_opened} | "
+                      f"LIVE Closed: {d.live_trades_closed} | "
+                      f"LIVE PnL: {d.live_pnl_sol:+.4f} SOL | "
                       f"Open: {stats.get('open_positions', 0)}/{stats.get('max_positions', 5)} | "
-                      f"Balance: {stats.get('balance', 0):.4f} SOL | "
-                      f"WR: {stats.get('win_rate', 0):.0%}{live_indicator}{exit_indicator}")
+                      f"Balance: {stats.get('balance', 0):.4f} SOL{live_indicator}{exit_indicator} | "
+                      f"Webhooks: {d.webhooks_received} | "
+                      f"Signals: {d.buy_signals_detected}")
+
+            # Hourly Telegram update focused on live trading progress
+            if trading_system.notifier and trading_system.notifier.enabled:
+                paper_stats = trading_system.paper_engine.get_stats() if trading_system.paper_engine else {}
+                live_status = trading_system.hybrid_engine.get_status() if trading_system.hybrid_engine else {}
+                trading_system.notifier.send_hourly_live_update(
+                    diagnostics=trading_system.diagnostics.to_dict(),
+                    paper_stats=paper_stats,
+                    live_status=live_status,
+                )
+
+            # Scheduled discovery every configured interval (default 12h)
+            if trading_system.historian and (now - last_discovery).total_seconds() >= CONFIG.discovery_interval_hours * 3600:
+                last_discovery = now
+                try:
+                    result = trading_system.run_discovery_cycle(reason='scheduled')
+                    wallets = result.get('wallets_verified', 0)
+                    calls = result.get('api_calls', 0)
+                    print(f"🔎 Discovery cycle complete: +{wallets} wallets (API calls: {calls})")
+                except Exception as e:
+                    print(f"Discovery cycle error: {e}")
+
+            # Scheduled learning every 6 hours
+            if trading_system.strategist and (now - last_learning).total_seconds() >= 6 * 3600:
+                last_learning = now
+                try:
+                    learning_result = trading_system.run_learning_cycle(force=True, reason='scheduled')
+                    print(f"🧠 Learning cycle: {learning_result.get('status', 'unknown')}")
+                except Exception as e:
+                    print(f"Learning cycle error: {e}")
             
             # ================================================================
             # NEW: BACKUP EXIT CHECK (every 60 seconds)
